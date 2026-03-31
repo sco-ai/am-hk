@@ -1,0 +1,119 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# 虚拟环境 - 必须排除
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# 开发环境
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 测试和覆盖率
+.coverage
+.tox/
+.nox/
+.pytest_cache/
+.mypy_cache/
+.pdm.toml
+.pdm-python
+
+# 日志文件
+*.log
+logs/
+
+# 数据库
+*.db
+*.sqlite3
+
+# 操作系统
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# 项目特定
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# 配置文件（除模板外）
+config/*.yaml
+config/*.yml
+config/*.json
+!config/*.example.yaml
+!config/*.example.yml
+!config/*.example.json
+
+# 临时文件
+temp/
+tmp/
+
+# 构建产物
+dist/
+build/
+*.exe
+*.dll
+
+# 文档生成
+docs/_build/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# 媒体文件（如需要可调整）
+*.mp4
+*.mov
+*.avi
+*.mp3
+*.wav
+
+# 压缩文件
+*.zip
+*.tar.gz
+*.rar
+
+# 备份文件
+*.bak
+*.backup
+
+# 密钥文件
+*.pem
+*.key
+*.crt
+*.csr
+
+# OpenClaw 工作区
+.openclaw/

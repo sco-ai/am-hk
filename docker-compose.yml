@@ -1,0 +1,70 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: am-hk-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2201
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2201:2201"
+    networks:
+      - am-hk-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: am-hk-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9112:9112"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2201
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9112
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9112
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - am-hk-network
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: am-hk-kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8100:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: am-hk-kafka
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9112
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2201
+    networks:
+      - am-hk-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: am-hk-redis
+    ports:
+      - "6399:6379"
+    networks:
+      - am-hk-network
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: am-hk-postgres
+    environment:
+      POSTGRES_DB: alphamind_hk
+      POSTGRES_USER: am_hk_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    ports:
+      - "5452:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - am-hk-network
+
+networks:
+  am-hk-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
