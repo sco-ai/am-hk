@@ -1,10 +1,11 @@
 """
-老虎证券数据连接器
+老虎证券数据连接器 - 支持代理
 港股/美股接入 - 模拟盘/实盘支持
 """
 import asyncio
 import json
 import logging
+import os
 from typing import Callable, Dict, List, Optional
 
 import httpx
@@ -26,6 +27,7 @@ class TigerConnector:
     - 订单簿数据
     - 交易执行（模拟盘/实盘）
     - WebSocket推送
+    - HTTP/HTTPS代理
     
     文档: https://www.itigerup.com/help/faq/133
     """
@@ -37,10 +39,11 @@ class TigerConnector:
     WS_URL_PAPER = "wss://openapi-sandbox.itigerup.com/websocket"
     WS_URL_LIVE = "wss://openapi.itigerup.com/websocket"
     
-    def __init__(self, account: str = None, private_key: str = None):
+    def __init__(self, account: str = None, private_key: str = None, proxy: str = None):
         self.account = account or settings.TIGER_ACCOUNT
         self.private_key = private_key or settings.TIGER_PRIVATE_KEY
         self.paper_trading = settings.TIGER_ENABLE_PAPER
+        self.proxy = proxy or os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
         
         # 选择端点
         if self.paper_trading:
@@ -52,17 +55,27 @@ class TigerConnector:
             self.ws_url = self.WS_URL_LIVE
             logger.warning("Tiger connector initialized [LIVE TRADING] - USE WITH CAUTION")
         
-        self.http_client: Optional[httpx.AsyncClient] = None
+        # 配置HTTP客户端使用代理
+        if self.proxy:
+            self.http_client: Optional[httpx.AsyncClient] = httpx.AsyncClient(
+                base_url=self.base_url,
+                timeout=30.0,
+                proxies=self.proxy,
+            )
+            logger.info(f"Using proxy: {self.proxy}")
+        else:
+            self.http_client: Optional[httpx.AsyncClient] = httpx.AsyncClient(
+                base_url=self.base_url,
+                timeout=30.0,
+            )
+        
         self.ws_connection: Optional[websockets.WebSocketClientProtocol] = None
         self.subscriptions: Dict[str, Callable] = {}
         self.running = False
     
     async def connect(self):
         """建立连接"""
-        self.http_client = httpx.AsyncClient(
-            base_url=self.base_url,
-            timeout=30.0,
-        )
+        # HTTP客户端已在__init__中创建
         self.running = True
         logger.info("Tiger HTTP client connected")
     
@@ -348,20 +361,45 @@ class TigerConnector:
         """WebSocket连接处理器"""
         while self.running:
             try:
-                async with websockets.connect(self.ws_url) as ws:
-                    self.ws_connection = ws
-                    logger.info("Tiger WebSocket connected")
+                # WebSocket代理配置
+                if self.proxy:
+                    import urllib.parse
+                    parsed = urllib.parse.urlparse(self.proxy)
+                    proxy_host = parsed.hostname
+                    proxy_port = parsed.port or 7890
                     
-                    # 发送订阅请求
-                    subscribe_msg = {
-                        "command": "subscribe",
-                        "account": self.account,
-                        "symbols": list(self.subscriptions.keys()),
-                    }
-                    await ws.send(json.dumps(subscribe_msg))
-                    
-                    async for message in ws:
-                        await self._handle_ws_message(message)
+                    async with websockets.connect(
+                        self.ws_url,
+                        proxy=f"http://{proxy_host}:{proxy_port}"
+                    ) as ws:
+                        self.ws_connection = ws
+                        logger.info("Tiger WebSocket connected via proxy")
+                        
+                        # 发送订阅请求
+                        subscribe_msg = {
+                            "command": "subscribe",
+                            "account": self.account,
+                            "symbols": list(self.subscriptions.keys()),
+                        }
+                        await ws.send(json.dumps(subscribe_msg))
+                        
+                        async for message in ws:
+                            await self._handle_ws_message(message)
+                else:
+                    async with websockets.connect(self.ws_url) as ws:
+                        self.ws_connection = ws
+                        logger.info("Tiger WebSocket connected")
+                        
+                        # 发送订阅请求
+                        subscribe_msg = {
+                            "command": "subscribe",
+                            "account": self.account,
+                            "symbols": list(self.subscriptions.keys()),
+                        }
+                        await ws.send(json.dumps(subscribe_msg))
+                        
+                        async for message in ws:
+                            await self._handle_ws_message(message)
             
             except Exception as e:
                 logger.error(f"WebSocket error: {e}")
@@ -386,11 +424,11 @@ class TigerConnector:
                               params: Optional[Dict] = None,
                               body: Optional[Dict] = None) -> Dict:
         """发送带签名的请求"""
-        import time
+        import time as time_module
         import hashlib
         import hmac
         
-        timestamp = str(int(time.time() * 1000))
+        timestamp = str(int(time_module.time() * 1000))
         
         # 构建签名字符串
         sign_str = f"{timestamp}{method.upper()}{endpoint}"

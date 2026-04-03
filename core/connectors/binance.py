@@ -1,5 +1,5 @@
 """
-币安数据连接器
+币安数据连接器 - 支持代理
 WebSocket实时数据 + REST API历史数据
 """
 import asyncio
@@ -7,6 +7,7 @@ import hmac
 import hashlib
 import json
 import logging
+import os
 import time
 from typing import Callable, Dict, List, Optional
 from urllib.parse import urlencode
@@ -28,16 +29,18 @@ class BinanceConnector:
     - WebSocket实时数据（K线、逐笔成交、订单簿）
     - REST API历史数据
     - 自动重连
+    - HTTP/HTTPS代理
     """
     
     WS_BASE = "wss://stream.binance.com:9443/ws"
     WS_STREAM_BASE = "wss://stream.binance.com:9443/stream?streams="
     API_BASE = "https://api.binance.com"
     
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
+    def __init__(self, api_key: str, api_secret: str, testnet: bool = False, proxy: str = None):
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
+        self.proxy = proxy or os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
         
         if testnet:
             self.WS_BASE = "wss://testnet.binance.vision/ws"
@@ -51,11 +54,21 @@ class BinanceConnector:
         self._reconnect_delay = 1
         self._max_reconnect_delay = 60
         
-        logger.info(f"Binance connector initialized (testnet={testnet})")
+        logger.info(f"Binance connector initialized (testnet={testnet}, proxy={self.proxy is not None})")
     
     async def connect(self):
-        """建立连接"""
-        self.session = aiohttp.ClientSession()
+        """建立连接（带代理）"""
+        # 配置aiohttp使用代理
+        if self.proxy:
+            connector = aiohttp.TCPConnector()
+            self.session = aiohttp.ClientSession(
+                connector=connector,
+                trust_env=True,  # 使用环境变量中的代理设置
+            )
+            logger.info(f"Using proxy: {self.proxy}")
+        else:
+            self.session = aiohttp.ClientSession()
+        
         self.running = True
         logger.info("Binance connector connected")
     
@@ -151,18 +164,43 @@ class BinanceConnector:
                 ws_url = f"{self.WS_BASE}/{stream_name}"
                 logger.debug(f"Connecting to {ws_url}")
                 
-                async with websockets.connect(ws_url) as ws:
-                    self.ws_connections[stream_name] = ws
-                    self._reconnect_delay = 1  # 重置重连延迟
+                # WebSocket代理配置
+                if self.proxy:
+                    # 使用代理连接WebSocket
+                    import urllib.parse
+                    parsed = urllib.parse.urlparse(self.proxy)
+                    proxy_host = parsed.hostname
+                    proxy_port = parsed.port or 7890
                     
-                    logger.info(f"WebSocket connected: {stream_name}")
-                    
-                    async for message in ws:
-                        try:
-                            data = json.loads(message)
-                            await callback(stream_name, data)
-                        except Exception as e:
-                            logger.error(f"Error processing message: {e}")
+                    # 通过代理建立WebSocket连接
+                    async with websockets.connect(
+                        ws_url,
+                        proxy=f"http://{proxy_host}:{proxy_port}"
+                    ) as ws:
+                        self.ws_connections[stream_name] = ws
+                        self._reconnect_delay = 1
+                        
+                        logger.info(f"WebSocket connected via proxy: {stream_name}")
+                        
+                        async for message in ws:
+                            try:
+                                data = json.loads(message)
+                                await callback(stream_name, data)
+                            except Exception as e:
+                                logger.error(f"Error processing message: {e}")
+                else:
+                    async with websockets.connect(ws_url) as ws:
+                        self.ws_connections[stream_name] = ws
+                        self._reconnect_delay = 1
+                        
+                        logger.info(f"WebSocket connected: {stream_name}")
+                        
+                        async for message in ws:
+                            try:
+                                data = json.loads(message)
+                                await callback(stream_name, data)
+                            except Exception as e:
+                                logger.error(f"Error processing message: {e}")
             
             except websockets.exceptions.ConnectionClosed:
                 logger.warning(f"WebSocket closed: {stream_name}")
@@ -308,10 +346,13 @@ class BinanceConnector:
     # === 内部方法 ===
     
     async def _rest_get(self, endpoint: str, params: Optional[Dict] = None) -> Dict:
-        """发送GET请求"""
+        """发送GET请求（带代理支持）"""
         url = f"{self.API_BASE}{endpoint}"
         
-        async with self.session.get(url, params=params) as response:
+        # 使用代理
+        proxy = self.proxy if self.proxy else None
+        
+        async with self.session.get(url, params=params, proxy=proxy) as response:
             if response.status != 200:
                 text = await response.text()
                 raise Exception(f"API error: {response.status} - {text}")
@@ -319,7 +360,7 @@ class BinanceConnector:
             return await response.json()
     
     async def _rest_get_signed(self, endpoint: str, params: Optional[Dict] = None) -> Dict:
-        """发送带签名的GET请求"""
+        """发送带签名的GET请求（带代理支持）"""
         params = params or {}
         params["timestamp"] = int(time.time() * 1000)
         
@@ -335,7 +376,10 @@ class BinanceConnector:
         url = f"{self.API_BASE}{endpoint}"
         headers = {"X-MBX-APIKEY": self.api_key}
         
-        async with self.session.get(url, params=params, headers=headers) as response:
+        # 使用代理
+        proxy = self.proxy if self.proxy else None
+        
+        async with self.session.get(url, params=params, headers=headers, proxy=proxy) as response:
             if response.status != 200:
                 text = await response.text()
                 raise Exception(f"API error: {response.status} - {text}")

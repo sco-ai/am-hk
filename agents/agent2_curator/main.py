@@ -1,6 +1,6 @@
 """
 Agent 2: DataCurator
-数据因子处理器
+数据因子处理器 - 集成FinBERT情绪分析
 """
 import asyncio
 import logging
@@ -11,6 +11,7 @@ import pandas as pd
 
 from core.kafka import MessageBus, AgentConsumer
 from core.models import FactorData, MarketData, MarketType
+from core.finbert_analyzer import FinBERTAnalyzer, analyze_news_sentiment
 from core.utils import dict_hash, generate_timestamp, setup_logging
 
 logger = setup_logging("agent2_curator")
@@ -22,6 +23,7 @@ class DataCurator:
     
     职责：
     - 30+机构级因子计算
+    - NLP情绪分析（FinBERT）
     - 多市场特征融合
     - 数据标准化
     - 异常检测
@@ -29,6 +31,7 @@ class DataCurator:
     模型：
     - 数据标准化：统计模型
     - 异常检测：Z-score, IsolationForest
+    - 情绪分析：FinBERT
     """
     
     def __init__(self):
@@ -50,8 +53,15 @@ class DataCurator:
         self.data_cache: Dict[str, List[Dict]] = {}
         self.max_cache_size = 1000
         
+        # 新闻缓存（用于情绪聚合）
+        self.news_cache: Dict[str, List[Dict]] = {}
+        self.news_max_cache = 50
+        
+        # FinBERT分析器
+        self.finbert = FinBERTAnalyzer()
+        
         self.running = False
-        logger.info(f"{self.agent_name} initialized")
+        logger.info(f"{self.agent_name} initialized (with FinBERT)")
     
     async def start(self):
         """启动处理器"""
@@ -60,11 +70,13 @@ class DataCurator:
         
         # 注册消息处理器
         self.consumer.register_handler("market_data", self._on_market_data)
+        self.consumer.register_handler("news", self._on_news_data)
         
         # 发布状态
         self.bus.publish_status({
             "state": "running",
             "factors_count": 30,
+            "sentiment_analysis": True,
         })
         
         # 启动消费者
@@ -81,6 +93,9 @@ class DataCurator:
         self.running = False
         self.consumer.stop()
         
+        # 关闭FinBERT
+        await self.finbert.close()
+        
         self.bus.publish_status({"state": "stopped"})
         self.bus.flush()
         self.bus.close()
@@ -93,12 +108,22 @@ class DataCurator:
             symbol = value.get("symbol")
             market = value.get("market")
             payload = value.get("payload", {})
+            data_type = value.get("data_type", "unknown")
+            
+            # 如果是新闻数据，单独处理
+            if data_type == "news" or data_type == "sentiment":
+                asyncio.create_task(self._process_news_async(symbol, value))
+                return
             
             # 更新缓存
             self._update_cache(symbol, payload)
             
             # 计算因子
             factors = self._calculate_factors(symbol, market, payload)
+            
+            # 添加情绪因子（如果有缓存的新闻）
+            sentiment_factors = self._get_sentiment_factors(symbol)
+            factors.update(sentiment_factors)
             
             # 异常检测
             if self._detect_anomaly(factors):
@@ -121,6 +146,94 @@ class DataCurator:
             
         except Exception as e:
             logger.error(f"Error processing market data: {e}", exc_info=True)
+    
+    def _on_news_data(self, key: str, value: Dict, headers: Optional[Dict]):
+        """处理新闻数据"""
+        asyncio.create_task(self._process_news_async(key, value))
+    
+    async def _process_news_async(self, symbol: str, news_data: Dict):
+        """异步处理新闻（情绪分析）"""
+        try:
+            payload = news_data.get("payload", {})
+            
+            # 构造新闻项
+            news_item = {
+                "symbol": symbol,
+                "title": payload.get("title", ""),
+                "content": payload.get("content", ""),
+                "source": payload.get("source", "unknown"),
+                "url": payload.get("url", ""),
+                "timestamp": news_data.get("timestamp", generate_timestamp().isoformat()),
+            }
+            
+            # FinBERT情绪分析
+            analyzed_news = await self.finbert.analyze_news(news_item)
+            
+            # 缓存分析结果
+            if symbol not in self.news_cache:
+                self.news_cache[symbol] = []
+            
+            self.news_cache[symbol].append(analyzed_news)
+            
+            # 限制缓存大小
+            if len(self.news_cache[symbol]) > self.news_max_cache:
+                self.news_cache[symbol] = self.news_cache[symbol][-self.news_max_cache:]
+            
+            sentiment = analyzed_news.get("sentiment", "neutral")
+            score = analyzed_news.get("sentiment_score", 0.0)
+            
+            logger.info(f"News sentiment analyzed for {symbol}: {sentiment} ({score:+.2f})")
+            
+        except Exception as e:
+            logger.error(f"Error analyzing news sentiment: {e}")
+    
+    def _get_sentiment_factors(self, symbol: str) -> Dict[str, float]:
+        """
+        获取情绪因子
+        
+        Returns:
+            情绪相关因子
+        """
+        factors = {}
+        
+        news_list = self.news_cache.get(symbol, [])
+        if not news_list:
+            return factors
+        
+        # 计算聚合情绪
+        scores = [n.get("sentiment_score", 0.0) for n in news_list]
+        confidences = [n.get("sentiment_confidence", 0.0) for n in news_list]
+        
+        if scores:
+            # 简单平均
+            factors["news_sentiment_avg"] = np.mean(scores)
+            
+            # 加权平均（按置信度）
+            if sum(confidences) > 0:
+                factors["news_sentiment_weighted"] = np.average(scores, weights=confidences)
+            
+            # 情绪变化（最新5条vs前5条）
+            if len(scores) >= 10:
+                recent = np.mean(scores[-5:])
+                past = np.mean(scores[-10:-5])
+                factors["news_sentiment_change"] = recent - past
+            
+            # 正面/负面新闻比例
+            positive_count = sum(1 for n in news_list if n.get("sentiment") == "positive")
+            negative_count = sum(1 for n in news_list if n.get("sentiment") == "negative")
+            total = len(news_list)
+            
+            factors["news_positive_ratio"] = positive_count / total if total > 0 else 0.5
+            factors["news_negative_ratio"] = negative_count / total if total > 0 else 0.5
+            
+            # 情绪极值
+            factors["news_sentiment_max"] = max(scores)
+            factors["news_sentiment_min"] = min(scores)
+            
+            # 新闻数量因子
+            factors["news_count_1h"] = len(news_list)
+        
+        return factors
     
     def _update_cache(self, symbol: str, data: Dict):
         """更新数据缓存"""
@@ -215,7 +328,7 @@ class DataCurator:
             return False
         
         # 检查关键因子的异常值
-        key_factors = ["mom_5m", "volatility_5m", "price_change"]
+        key_factors = ["mom_5m", "volatility_5m", "price_change", "news_sentiment_avg"]
         
         for factor in key_factors:
             if factor in factors:
