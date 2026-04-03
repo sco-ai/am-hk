@@ -69,6 +69,12 @@ class Settings(BaseSettings):
     FINBERT_API_URL: str = ""
     FINBERT_API_KEY: str = ""
     
+    # === 新闻 API 配置 ===
+    NEWSAPI_KEY: str = ""
+    TWITTER_BEARER_TOKEN: str = ""
+    REDDIT_CLIENT_ID: str = ""
+    REDDIT_SECRET: str = ""
+    
     # === 交易 API 配置 ===
     BINANCE_API_KEY: str = ""
     BINANCE_SECRET: str = ""

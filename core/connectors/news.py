@@ -32,11 +32,11 @@ class NewsConnector:
     """
     
     def __init__(self):
-        # API密钥
-        self.newsapi_key = os.getenv("NEWSAPI_KEY", "")
-        self.twitter_bearer = os.getenv("TWITTER_BEARER_TOKEN", "")
-        self.reddit_client_id = os.getenv("REDDIT_CLIENT_ID", "")
-        self.reddit_secret = os.getenv("REDDIT_SECRET", "")
+        # API密钥 - 优先从settings读取，其次环境变量
+        self.newsapi_key = settings.NEWSAPI_KEY or os.getenv("NEWSAPI_KEY", "")
+        self.twitter_bearer = settings.TWITTER_BEARER_TOKEN or os.getenv("TWITTER_BEARER_TOKEN", "")
+        self.reddit_client_id = settings.REDDIT_CLIENT_ID or os.getenv("REDDIT_CLIENT_ID", "")
+        self.reddit_secret = settings.REDDIT_SECRET or os.getenv("REDDIT_SECRET", "")
         
         # HTTP客户端（带代理支持）
         proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
