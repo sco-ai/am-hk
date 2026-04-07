@@ -80,7 +80,10 @@ class Settings(BaseSettings):
     BINANCE_SECRET: str = ""
     BINANCE_TESTNET: bool = True
     
+    TIGER_ID: str = ""
     TIGER_ACCOUNT: str = ""
+    TIGER_LICENSE: str = ""
+    TIGER_ENV: str = "PROD"
     TIGER_PRIVATE_KEY: str = ""
     TIGER_ENABLE_PAPER: bool = True  # true=模拟盘, false=实盘
     

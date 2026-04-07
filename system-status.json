@@ -1,30 +1,29 @@
 {
   "version": "3.0.0",
   "status": "running",
-  "timestamp": "2026-04-08T00:39:00+08:00",
+  "timestamp": "2026-04-08T00:57:00+08:00",
   "database": {
     "postgresql": {"host": "localhost", "port": 5452, "database": "alphamind_hk", "user": "am_hk_user", "status": "connected"},
     "redis": {"host": "localhost", "port": 6399, "status": "connected"}
   },
   "apis": {
-    "binance": {"testnet": true, "status": "connected", "configured": "2026-04-08"},
-    "newsapi": {"status": "configured", "configured": "2026-04-08", "note": "需要代理访问外部网络"}
+    "binance": {"testnet": false, "status": "configured", "configured": "2026-04-08"},
+    "tiger": {"status": "configured", "env": "PROD", "paper": true, "configured": "2026-04-08"},
+    "newsapi": {"status": "configured", "configured": "2026-04-08"}
   },
   "services": {
     "zookeeper": {"port": 2201, "status": "not_installed"},
     "kafka": {"port": 9112, "status": "not_installed", "fallback": "redis"},
     "kafka_ui": {"port": 8100, "status": "not_installed"},
-    "api": {"port": 8020, "status": "ready"}
+    "api": {"port": 8020, "status": "ready"},
+    "dashboard": {"port": 5020, "status": "ready"}
   },
   "agents": {
-    "agent1_harvester": {"status": "ready", "backend": "redis", "data_sources": ["binance", "newsapi"]},
+    "agent1_harvester": {"status": "ready", "backend": "redis", "data_sources": ["binance", "tiger", "newsapi"]},
     "agent2_curator": {"status": "ready", "backend": "redis", "features": ["finbert"]},
     "agent3_scanner": {"status": "ready", "backend": "redis"},
     "agent4_oracle": {"status": "ready", "backend": "redis", "models": ["informer", "n-hits", "ppo"]},
     "agent5_guardian": {"status": "ready", "backend": "redis"},
     "agent6_learning": {"status": "ready", "backend": "redis"}
-  },
-  "network": {
-    "proxy": {"http": "http://127.0.0.1:7890", "status": "needs_restart"}
   }
 }
