@@ -18,6 +18,32 @@ import websockets
 from core.models import MarketType, DataType
 from core.utils import setup_logging
 
+# 导入REST模式作为默认
+from .binance_rest import BinanceRESTConnector
+
+logger = setup_logging("binance_connector")
+
+# 使用REST连接器作为默认
+BinanceConnector = BinanceRESTConnector
+
+# 保持向后兼容
+__all__ = ['BinanceConnector', 'BinanceRESTConnector']
+import asyncio
+import hmac
+import hashlib
+import json
+import logging
+import os
+import time
+from typing import Callable, Dict, List, Optional
+from urllib.parse import urlencode
+
+import aiohttp
+import websockets
+
+from core.models import MarketType, DataType
+from core.utils import setup_logging
+
 logger = setup_logging("binance_connector")
 
 

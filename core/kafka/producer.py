@@ -138,6 +138,10 @@ class MessageBus:
         except Exception as e:
             logger.error(f"发送失败: {e}")
     
+    def send(self, topic: str, key: str, value: Dict):
+        """发送消息（公共API）"""
+        self._send(topic, key, value)
+    
     def publish_market_data(self, symbol: str, data: Dict):
         """发布原始市场数据"""
         self._send(self.topics["raw_market_data"], symbol, data)

@@ -367,30 +367,62 @@ async def websocket_endpoint(websocket: WebSocket):
             # 非阻塞获取消息
             message = pubsub.get_message(timeout=1)
             if message and message["type"] == "message":
-                data = json.loads(message["data"])
-                
-                # 根据数据类型处理
+                envelope = json.loads(message["data"])
+                # 解析消息信封结构: {"key": ..., "value": {...}, "topic": ...}
+                data = envelope.get("value", {})
                 data_type = data.get("data_type", "unknown")
                 
-                if data_type == "tick":
+                if data_type == "kline":
+                    payload = data.get("payload", {})
+                    price_data = {
+                        "symbol": data.get("symbol", "UNKNOWN"),
+                        "price": payload.get("close", 0),
+                        "change_pct": payload.get("change", 0),
+                        "volume": payload.get("volume", 0),
+                        "timestamp": data.get("timestamp", datetime.now().isoformat()),
+                    }
+                    recent_data["prices"].append(price_data)
+                    if len(recent_data["prices"]) > 100:
+                        recent_data["prices"] = recent_data["prices"][-100:]
+                    
                     await websocket.send_json({
                         "type": "price",
-                        "data": data.get("payload", {})
+                        "data": price_data
                     })
                 elif data_type == "trade":
+                    payload = data.get("payload", {})
+                    trade_data = {
+                        "price": payload.get("price", 0),
+                        "amount": payload.get("amount", 0),
+                        "timestamp": data.get("timestamp", datetime.now().isoformat()),
+                    }
+                    recent_data["trades"].insert(0, trade_data)
+                    if len(recent_data["trades"]) > 50:
+                        recent_data["trades"] = recent_data["trades"][:50]
+                    
                     await websocket.send_json({
                         "type": "trade",
-                        "data": {"trades": [data.get("payload", {})]}
+                        "data": {"trades": [trade_data]}
                     })
                 elif data_type == "orderbook":
+                    payload = data.get("payload", {})
+                    recent_data["orderbook"].insert(0, payload)
+                    if len(recent_data["orderbook"]) > 20:
+                        recent_data["orderbook"] = recent_data["orderbook"][:20]
+                    
                     await websocket.send_json({
                         "type": "orderbook",
-                        "data": data.get("payload", {})
+                        "data": payload
                     })
                 elif data_type == "news":
+                    payload = data.get("payload", {})
+                    recent_data["news"].insert(0, payload)
+                    if len(recent_data["news"]) > 10:
+                        recent_data["news"] = recent_data["news"][:10]
+                    
                     await websocket.send_json({
                         "type": "news",
-                        "data": {"articles": [data.get("payload", {})]}
+                        "data": {"articles": [payload]}
                     })
             
             # 检查客户端是否断开

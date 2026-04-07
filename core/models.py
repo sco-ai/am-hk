@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 class MarketType(str, Enum):
     """市场类型"""
     BTC = "btc"
+    CRYPTO = "CRYPTO"  # 加密货币统一标识
     HK_STOCK = "hk_stock"
     US_STOCK = "us_stock"
     NEWS = "news"

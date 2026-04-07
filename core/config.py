@@ -4,11 +4,17 @@
 import os
 from typing import Dict, List, Optional
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     """应用配置"""
+    
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
     
     # 应用信息
     APP_NAME: str = "AM-HK"
@@ -78,7 +84,7 @@ class Settings(BaseSettings):
     # === 交易 API 配置 ===
     BINANCE_API_KEY: str = ""
     BINANCE_SECRET: str = ""
-    BINANCE_TESTNET: bool = True
+    BINANCE_TESTNET: bool = False  # 默认主网
     
     TIGER_ID: str = ""
     TIGER_ACCOUNT: str = ""
@@ -116,10 +122,6 @@ class Settings(BaseSettings):
     # 日志配置
     LOG_LEVEL: str = "INFO"
     LOG_FORMAT: str = "json"
-    
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
     
     @property
     def database_url(self) -> str:

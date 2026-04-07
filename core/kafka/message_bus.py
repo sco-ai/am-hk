@@ -6,6 +6,7 @@
 """
 import json
 import logging
+from datetime import datetime
 from typing import Callable, Dict, Optional
 
 from core.config import settings
@@ -71,30 +72,22 @@ class MessageBus:
         logger.warning(f"[{client_id}] 使用内存模式 (无持久化)")
     
     def send(self, topic: str, key: str, value: Dict):
-        """发送消息"""
+        """发送消息 (Redis原生)"""
         try:
-            if self.backend == "kafka" and self.producer:
-                self.producer.produce(
-                    topic=topic,
-                    key=key.encode() if key else None,
-                    value=json.dumps(value).encode()
-                )
-                self.producer.poll(0)
+            import json
+            import redis
             
-            elif self.backend == "redis" and self.redis_client:
-                message = {
-                    "key": key,
-                    "value": value,
-                    "topic": topic
-                }
-                self.redis_client.publish(topic, json.dumps(message))
+            # 直接使用Redis发布
+            r = redis.from_url(settings.redis_url)
+            message = {
+                "key": key,
+                "value": value,
+                "topic": topic,
+                "timestamp": datetime.now().isoformat()
+            }
+            r.publish(topic, json.dumps(message))
+            logger.debug(f"Published to {topic}: {key}")
             
-            elif self.backend == "memory":
-                if topic not in self.subscribers:
-                    self.subscribers[topic] = []
-                for callback in self.subscribers[topic]:
-                    callback(key, value)
-                    
         except Exception as e:
             logger.error(f"发送消息失败: {e}")
     
