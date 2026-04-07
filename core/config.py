@@ -103,6 +103,10 @@ class Settings(BaseSettings):
     FEISHU_APP_SECRET: str = ""
     FEISHU_WEBHOOK_URL: str = ""
     
+    # 代理配置
+    HTTP_PROXY: str = ""
+    HTTPS_PROXY: str = ""
+    
     # 应用安全配置
     SECRET_KEY: str = "generate_a_strong_secret_key_here"
     
