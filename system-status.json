@@ -1,0 +1,23 @@
+{
+  "version": "3.0.0",
+  "status": "running",
+  "timestamp": "2026-04-08T00:33:41+08:00",
+  "database": {
+    "postgresql": {"host": "localhost", "port": 5452, "database": "alphamind_hk", "user": "am_hk_user", "status": "connected"},
+    "redis": {"host": "localhost", "port": 6399, "status": "connected"}
+  },
+  "services": {
+    "zookeeper": {"port": 2201, "status": "not_installed"},
+    "kafka": {"port": 9112, "status": "not_installed", "fallback": "redis"},
+    "kafka_ui": {"port": 8100, "status": "not_installed"},
+    "api": {"port": 8020, "status": "ready"}
+  },
+  "agents": {
+    "agent1_harvester": {"status": "running", "backend": "redis"},
+    "agent2_curator": {"status": "running", "backend": "redis", "features": ["finbert"]},
+    "agent3_scanner": {"status": "running", "backend": "redis"},
+    "agent4_oracle": {"status": "running", "backend": "redis", "models": ["informer", "n-hits", "ppo"]},
+    "agent5_guardian": {"status": "running", "backend": "redis"},
+    "agent6_learning": {"status": "running", "backend": "redis"}
+  }
+}
