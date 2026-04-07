@@ -1,693 +1,380 @@
+"""
+Agent 3: AlphaScanner (机会筛选器) - v3.0 Enhanced
+多策略扫描、LightGBM因子评分、GPT-4.1策略优化、Top机会分层
+
+职责：
+- 接收 Agent2 的因子数据（Kafka: am-hk-processed-data）
+- 多策略并行扫描（动量/价值/情绪/跨市场传导）
+- LightGBM模型实时评分
+- GPT-4.1动态阈值优化和策略权重调整
+- Top机会排序和分层（Top10/Top20交易池生成）
+- 输出交易机会到 Kafka: am-hk-trading-opportunities
+"""
+import asyncio
+import json
+import logging
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+from core.kafka import MessageBus, AgentConsumer
+from core.models import MarketType, ActionType
+from core.ai_models import ModelFactory, LLMTradingAnalyzer
+from core.utils import generate_msg_id, generate_timestamp, setup_logging
+from core.config import settings
+
+logger = setup_logging("agent3_scanner")
 
 
-class MultiStrategyScanner:
-    """多策略并行扫描器"""
+class StrategyType(str, Enum):
+    """策略类型"""
+    MOMENTUM = "momentum"           # 动量策略
+    VALUE = "value"                 # 价值策略
+    SENTIMENT = "sentiment"         # 情绪策略
+    CROSS_MARKET = "cross_market"   # 跨市场传导策略
+
+
+class OpportunityPool(str, Enum):
+    """交易池分层"""
+    TOP5_CORE = "top5"              # Top 5 核心仓
+    TOP6_10_OPPORTUNITY = "top10"   # Top 6-10 机会仓
+    TOP11_20_OBSERVATION = "top20"  # Top 11-20 观察池
+    REJECTED = "rejected"           # 未入选
+
+
+class Direction(str, Enum):
+    """交易方向"""
+    BUY = "BUY"
+    SELL = "SELL"
+    HOLD = "HOLD"
+
+
+@dataclass
+class StrategyScore:
+    """策略评分结果"""
+    strategy_type: StrategyType
+    raw_score: float                # 原始评分
+    normalized_score: float         # 归一化评分(0-1)
+    direction: Direction
+    confidence: float               # 策略置信度
+    factors_used: List[str]         # 使用的因子
+    reasoning: str                  # 策略推理
+
+
+@dataclass
+class Opportunity:
+    """交易机会"""
+    symbol: str
+    market: str
+    timestamp: int
+    rank: int
+    pool: OpportunityPool
+    direction: Direction
+    confidence: float               # 综合置信度
+    score: float                    # LightGBM综合评分
+    
+    # 策略分解
+    strategy_scores: Dict[str, StrategyScore] = field(default_factory=dict)
+    strategy_weights: Dict[str, float] = field(default_factory=dict)
+    
+    # 因子数据
+    factors: Dict[str, float] = field(default_factory=dict)
+    cross_market_signals: List[Dict] = field(default_factory=list)
+    
+    # 推理和阈值
+    reasoning: str = ""
+    thresholds: Dict[str, float] = field(default_factory=dict)
+    
+    # 元数据
+    processing_time_ms: float = 0.0
+    model_version: str = "v3.0"
+
+    def to_dict(self) -> Dict:
+        """转换为输出格式"""
+        return {
+            "symbol": self.symbol,
+            "market": self.market,
+            "timestamp": self.timestamp,
+            "rank": self.rank,
+            "pool": self.pool.value,
+            "direction": self.direction.value,
+            "confidence": round(self.confidence, 4),
+            "score": round(self.score, 4),
+            "factors": self.factors,
+            "reasoning": self.reasoning,
+            "strategy_weights": self.strategy_weights,
+            "thresholds": self.thresholds,
+            "strategy_breakdown": {
+                k: {
+                    "raw_score": round(v.raw_score, 4),
+                    "normalized_score": round(v.normalized_score, 4),
+                    "direction": v.direction.value,
+                    "confidence": round(v.confidence, 4),
+                    "reasoning": v.reasoning,
+                }
+                for k, v in self.strategy_scores.items()
+            },
+            "cross_market_signals": self.cross_market_signals[:3],  # 只取前3个
+            "metadata": {
+                "processing_time_ms": round(self.processing_time_ms, 2),
+                "model_version": self.model_version,
+            }
+        }
+
+
+@dataclass
+class MarketContext:
+    """市场环境上下文"""
+    timestamp: int
+    volatility_regime: str          # high/medium/low
+    trend_strength: float           # 趋势强度
+    market_sentiment: float         # 市场情绪(-1到1)
+    capital_flow_direction: str     # inflow/outflow/neutral
+    btc_momentum: float             # BTC动量
+    us_market_state: str            # 美股状态
+    
+    def to_prompt_context(self) -> str:
+        """转换为LLM prompt上下文"""
+        return f"""当前市场环境:
+- 波动率状态: {self.volatility_regime}
+- 趋势强度: {self.trend_strength:.2f}
+- 市场情绪: {self.market_sentiment:+.2f}
+- 资金流向: {self.capital_flow_direction}
+- BTC动量: {self.btc_momentum:+.2f}%
+- 美股状态: {self.us_market_state}
+"""
+
+
+class LightGBMFactorScorer:
+    """
+    LightGBM因子评分器
+    
+    当前使用规则模拟，后续接入云训练模型
+    """
     
     def __init__(self):
-        self.strategies = {
-            StrategyType.MOMENTUM: self._scan_momentum,
-            StrategyType.VALUE: self._scan_value,
-            StrategyType.SENTIMENT: self._scan_sentiment,
-            StrategyType.CROSS_MARKET: self._scan_cross_market,
-        }
+        self.feature_names = [
+            # 量价因子
+            "price_momentum_5m", "price_momentum_15m", "price_momentum_1h",
+            "volume_momentum", "volatility_5m", "volatility_20",
+            "liquidity_score", "turnover_rate", "price_acceleration",
+            "volume_price_trend",
+            # 技术指标
+            "ma_5", "ma_20", "rsi_14", "macd", "macd_signal",
+            "bb_upper", "bb_lower", "atr_14",
+            # 盘口因子
+            "bid_ask_spread", "orderbook_imbalance", "depth_imbalance",
+            "depth_change_rate", "bid_pressure", "ask_pressure",
+            # 资金流因子
+            "net_inflow_speed", "main_force_ratio", "retail_ratio",
+            "main_retail_ratio", "northbound_strength", "large_order_net",
+            # 跨市场因子
+            "crypto_correlation", "us_lead_lag", "cross_market_momentum",
+            "layer1_signal", "layer2_confirm",
+        ]
+        self.model_version = "v3.0-cloud"
+        
+    def score(self, factors: Dict[str, float], market_context: MarketContext) -> float:
+        """
+        计算综合评分
+        
+        Returns:
+            score: 0-1之间的综合评分
+        """
+        if not factors:
+            return 0.0
+        
+        scores = []
+        weights = []
+        
+        # 1. 短期动量评分 (权重: 0.20)
+        mom_score = self._calc_momentum_score(factors)
+        scores.append(mom_score)
+        weights.append(0.20)
+        
+        # 2. 趋势评分 (权重: 0.15)
+        trend_score = self._calc_trend_score(factors)
+        scores.append(trend_score)
+        weights.append(0.15)
+        
+        # 3. 情绪/RSI评分 (权重: 0.15)
+        sentiment_score = self._calc_sentiment_score(factors)
+        scores.append(sentiment_score)
+        weights.append(0.15)
+        
+        # 4. 资金流评分 (权重: 0.20)
+        flow_score = self._calc_capital_flow_score(factors)
+        scores.append(flow_score)
+        weights.append(0.20)
+        
+        # 5. 盘口结构评分 (权重: 0.15)
+        orderbook_score = self._calc_orderbook_score(factors)
+        scores.append(orderbook_score)
+        weights.append(0.15)
+        
+        # 6. 跨市场传导评分 (权重: 0.15)
+        cross_market_score = self._calc_cross_market_score(factors, market_context)
+        scores.append(cross_market_score)
+        weights.append(0.15)
+        
+        # 加权平均
+        weighted_score = sum(s * w for s, w in zip(scores, weights))
+        
+        # 根据市场环境调整
+        adjusted_score = self._adjust_for_market_regime(weighted_score, market_context)
+        
+        return max(0.0, min(1.0, adjusted_score))
     
-    def scan_all(self, symbol: str, factors: Dict, 
-                 cross_signals: List[Dict], context: MarketContext) -> Dict[str, StrategyScore]:
-        """执行所有策略扫描"""
-        results = {}
+    def _calc_momentum_score(self, factors: Dict) -> float:
+        """计算动量评分"""
+        score = 0.5  # 中性基准
         
-        for strategy_type, scan_func in self.strategies.items():
-            try:
-                score = scan_func(symbol, factors, cross_signals, context)
-                results[strategy_type.value] = score
-            except Exception as e:
-                logger.error(f"Strategy {strategy_type} scan failed for {symbol}: {e}")
-                results[strategy_type.value] = StrategyScore(
-                    strategy_type=strategy_type,
-                    raw_score=0.5,
-                    normalized_score=0.5,
-                    direction=Direction.HOLD,
-                    confidence=0.0,
-                    factors_used=[],
-                    reasoning=f"扫描失败: {str(e)}"
-                )
-        
-        return results
-    
-    def _scan_momentum(self, symbol: str, factors: Dict, 
-                       cross_signals: List[Dict], context: MarketContext) -> StrategyScore:
-        """动量策略扫描"""
-        score = 0.0
-        factors_used = []
-        
-        # 短期动量
+        # 5分钟动量
         mom_5m = factors.get("price_momentum_5m", 0)
+        if abs(mom_5m) > 2.0:
+            score += np.sign(mom_5m) * min(abs(mom_5m) / 10, 0.2)
+        
+        # 15分钟动量
         mom_15m = factors.get("price_momentum_15m", 0)
+        if abs(mom_15m) > 3.0:
+            score += np.sign(mom_15m) * min(abs(mom_15m) / 15, 0.15)
         
-        if mom_5m > 1.5 and mom_15m > 2.0:
-            score = (mom_5m + mom_15m) / 20
-            direction = Direction.BUY
-            factors_used = ["price_momentum_5m", "price_momentum_15m"]
-        elif mom_5m < -1.5 and mom_15m < -2.0:
-            score = (abs(mom_5m) + abs(mom_15m)) / 20
-            direction = Direction.SELL
-            factors_used = ["price_momentum_5m", "price_momentum_15m"]
-        else:
-            score = 0.3
-            direction = Direction.HOLD
-            factors_used = ["price_momentum_5m"]
-        
-        # 成交量确认
+        # 成交量动量
         vol_mom = factors.get("volume_momentum", 1.0)
-        if vol_mom > 1.3:
-            score *= 1.2
-            factors_used.append("volume_momentum")
+        if vol_mom > 1.5:
+            score += 0.1 * min((vol_mom - 1.5), 1.0)
         
-        reasoning = f"5m动量{mom_5m:+.2f}%, 15m动量{mom_15m:+.2f}%, 成交量倍数{vol_mom:.2f}x"
+        # 价格加速度
+        accel = factors.get("price_acceleration", 0)
+        score += np.sign(accel) * min(abs(accel) / 5, 0.1)
         
-        return StrategyScore(
-            strategy_type=StrategyType.MOMENTUM,
-            raw_score=score,
-            normalized_score=min(score, 1.0),
-            direction=direction,
-            confidence=min(score * 0.8 + 0.2, 0.95),
-            factors_used=factors_used,
-            reasoning=reasoning
-        )
+        return max(0.0, min(1.0, score))
     
-    def _scan_value(self, symbol: str, factors: Dict,
-                    cross_signals: List[Dict], context: MarketContext) -> StrategyScore:
-        """价值策略扫描（均值回归）"""
-        score = 0.0
-        factors_used = []
+    def _calc_trend_score(self, factors: Dict) -> float:
+        """计算趋势评分"""
+        score = 0.5
+        
+        # MA趋势
+        ma_5 = factors.get("ma_5", 0)
+        ma_20 = factors.get("ma_20", 0)
+        if ma_5 > 0 and ma_20 > 0:
+            ma_diff = (ma_5 - ma_20) / ma_20
+            score += np.sign(ma_diff) * min(abs(ma_diff) * 10, 0.3)
+        
+        # MACD
+        macd = factors.get("macd", 0)
+        macd_signal = factors.get("macd_signal", 0)
+        if macd > macd_signal:
+            score += 0.1
+        else:
+            score -= 0.1
+        
+        return max(0.0, min(1.0, score))
+    
+    def _calc_sentiment_score(self, factors: Dict) -> float:
+        """计算情绪评分"""
+        score = 0.5
         
         rsi = factors.get("rsi_14", 50)
-        bb_lower = factors.get("bb_lower", 0)
+        if rsi > 70:
+            score = 0.3  # 超买
+        elif rsi < 30:
+            score = 0.7  # 超卖
+        else:
+            score = 0.5 + (50 - rsi) / 100  # 中间区域
+        
+        # 布林带位置
         bb_upper = factors.get("bb_upper", 0)
-        close = factors.get("ma_5", 0)
+        bb_lower = factors.get("bb_lower", 0)
+        close = factors.get("ma_5", (bb_upper + bb_lower) / 2 if bb_upper and bb_lower else 0)
+        if bb_upper > bb_lower > 0:
+            bb_position = (close - bb_lower) / (bb_upper - bb_lower)
+            if bb_position > 0.8:
+                score -= 0.1
+            elif bb_position < 0.2:
+                score += 0.1
         
-        # RSI超卖 + 接近布林带下轨 = 买入机会
-        if rsi < 35 and close > 0 and bb_lower > 0:
-            bb_deviation = (close - bb_lower) / close
-            if bb_deviation < 0.02:
-                score = (35 - rsi) / 35 * 0.7 + 0.3
-                direction = Direction.BUY
-                factors_used = ["rsi_14", "bb_lower"]
-                reasoning = f"RSI超卖({rsi:.1f})+接近布林带下轨"
-            else:
-                score = 0.4
-                direction = Direction.HOLD
-                factors_used = ["rsi_14"]
-                reasoning = f"RSI偏低({rsi:.1f})但未到下轨"
-        
-        # RSI超买 + 接近布林带上轨 = 卖出机会
-        elif rsi > 65 and close > 0 and bb_upper > 0:
-            bb_deviation = (bb_upper - close) / close
-            if bb_deviation < 0.02:
-                score = (rsi - 65) / 35 * 0.7 + 0.3
-                direction = Direction.SELL
-                factors_used = ["rsi_14", "bb_upper"]
-                reasoning = f"RSI超买({rsi:.1f})+接近布林带上轨"
-            else:
-                score = 0.4
-                direction = Direction.HOLD
-                factors_used = ["rsi_14"]
-                reasoning = f"RSI偏高({rsi:.1f})但未到上轨"
-        else:
-            score = 0.3
-            direction = Direction.HOLD
-            factors_used = ["rsi_14"]
-            reasoning = f"RSI中性({rsi:.1f})"
-        
-        return StrategyScore(
-            strategy_type=StrategyType.VALUE,
-            raw_score=score,
-            normalized_score=min(score, 1.0),
-            direction=direction,
-            confidence=min(score * 0.7 + 0.2, 0.9),
-            factors_used=factors_used,
-            reasoning=reasoning
-        )
+        return max(0.0, min(1.0, score))
     
-    def _scan_sentiment(self, symbol: str, factors: Dict,
-                        cross_signals: List[Dict], context: MarketContext) -> StrategyScore:
-        """情绪策略扫描"""
-        score = 0.0
-        factors_used = []
+    def _calc_capital_flow_score(self, factors: Dict) -> float:
+        """计算资金流评分"""
+        score = 0.5
         
+        # 主力资金比率
         main_ratio = factors.get("main_force_ratio", 0)
+        score += main_ratio * 0.3
+        
+        # 北水强度
         northbound = factors.get("northbound_strength", 0)
-        main_retail = factors.get("main_retail_ratio", 0)
+        score += northbound * 0.2
         
-        sentiment_score = main_ratio * 0.4 + northbound * 0.4 + np.sign(main_retail) * min(abs(main_retail) / 10, 0.2) * 0.2
+        # 大单净流入
+        large_net = factors.get("large_order_net", 0)
+        if large_net != 0:
+            score += np.sign(large_net) * min(abs(large_net) / 1e6, 0.1)
         
-        if sentiment_score > 0.3:
-            score = sentiment_score
-            direction = Direction.BUY
-            reasoning = f"主力资金流入({main_ratio:+.2f})+北水强势({northbound:+.2f})"
-        elif sentiment_score < -0.3:
-            score = abs(sentiment_score)
-            direction = Direction.SELL
-            reasoning = f"主力资金流出({main_ratio:+.2f})+北水弱势({northbound:+.2f})"
-        else:
-            score = 0.3
-            direction = Direction.HOLD
-            reasoning = f"资金流中性(主力{main_ratio:+.2f},北水{northbound:+.2f})"
-        
-        factors_used = ["main_force_ratio", "northbound_strength", "main_retail_ratio"]
-        
-        return StrategyScore(
-            strategy_type=StrategyType.SENTIMENT,
-            raw_score=score,
-            normalized_score=min(score, 1.0),
-            direction=direction,
-            confidence=min(abs(sentiment_score) * 0.8 + 0.2, 0.9),
-            factors_used=factors_used,
-            reasoning=reasoning
-        )
+        return max(0.0, min(1.0, score))
     
-    def _scan_cross_market(self, symbol: str, factors: Dict,
-                           cross_signals: List[Dict], context: MarketContext) -> StrategyScore:
-        """跨市场传导策略扫描"""
-        score = 0.0
-        factors_used = []
+    def _calc_orderbook_score(self, factors: Dict) -> float:
+        """计算盘口评分"""
+        score = 0.5
         
+        # 订单簿不平衡
+        imbalance = factors.get("orderbook_imbalance", 0)
+        score += imbalance * 0.3
+        
+        # 深度不平衡
+        depth_imb = factors.get("depth_imbalance", 0)
+        score += depth_imb * 0.2
+        
+        # 买卖压力
+        bid_pressure = factors.get("bid_pressure", 0.5)
+        ask_pressure = factors.get("ask_pressure", 0.5)
+        if bid_pressure + ask_pressure > 0:
+            pressure_ratio = bid_pressure / (bid_pressure + ask_pressure)
+            score += (pressure_ratio - 0.5) * 0.4
+        
+        return max(0.0, min(1.0, score))
+    
+    def _calc_cross_market_score(self, factors: Dict, context: MarketContext) -> float:
+        """计算跨市场传导评分"""
+        score = 0.5
+        
+        # Layer1信号 (Crypto)
         layer1 = factors.get("layer1_signal", 0)
+        if abs(layer1) > 1.0:
+            score += np.sign(layer1) * min(abs(layer1) / 10, 0.2)
+        
+        # Layer2信号 (美股)
         layer2 = factors.get("layer2_confirm", 0)
+        if abs(layer2) > 1.0:
+            score += np.sign(layer2) * min(abs(layer2) / 10, 0.15)
         
-        if abs(layer1) > 1.0 and abs(layer2) > 1.0:
-            if np.sign(layer1) == np.sign(layer2):
-                score = (abs(layer1) + abs(layer2)) / 20
-                direction = Direction.BUY if layer1 > 0 else Direction.SELL
-                reasoning = f"跨市场传导一致: Layer1({layer1:+.2f})+Layer2({layer2:+.2f})"
-            else:
-                score = 0.35
-                direction = Direction.HOLD
-                reasoning = f"跨市场信号冲突: Layer1({layer1:+.2f}) vs Layer2({layer2:+.2f})"
-        elif abs(layer1) > 2.0:
-            score = abs(layer1) / 15
-            direction = Direction.BUY if layer1 > 0 else Direction.SELL
-            reasoning = f"Layer1强信号({layer1:+.2f})"
-        elif abs(layer2) > 2.0:
-            score = abs(layer2) / 15
-            direction = Direction.BUY if layer2 > 0 else Direction.SELL
-            reasoning = f"Layer2强信号({layer2:+.2f})"
-        else:
-            score = 0.25
-            direction = Direction.HOLD
-            reasoning = f"跨市场信号弱: Layer1({layer1:+.2f}), Layer2({layer2:+.2f})"
+        # 综合传导动量
+        cross_mom = factors.get("cross_market_momentum", 0)
+        score += np.sign(cross_mom) * min(abs(cross_mom) / 10, 0.15)
         
-        factors_used = ["layer1_signal", "layer2_confirm"]
+        # 与BTC相关性调整
+        btc_corr = factors.get("crypto_correlation", 0)
+        if btc_corr > 0.3 and abs(context.btc_momentum) > 2.0:
+            score += np.sign(context.btc_momentum) * btc_corr * 0.1
         
-        strong_signals = [s for s in cross_signals if s.get("strength", 0) > 0.5]
-        if strong_signals:
-            score *= 1.1
-            factors_used.append("cross_market_signals")
-        
-        return StrategyScore(
-            strategy_type=StrategyType.CROSS_MARKET,
-            raw_score=score,
-            normalized_score=min(score, 1.0),
-            direction=direction,
-            confidence=min(score * 0.75 + 0.15, 0.9),
-            factors_used=factors_used,
-            reasoning=reasoning
-        )
-
-
-class StrategyOptimizer:
-    """
-    策略优化器 - GPT-4.1 API调用封装
+        return max(0.0, min(1.0, score))
     
-    功能:
-    1. 阈值动态优化
-    2. 策略权重调整
-    """
-    
-    def __init__(self):
-        self.llm_analyzer = ModelFactory.get_llm_analyzer()
-        self.cache = {}
-        self.cache_ttl = 300
-        self.last_optimization = 0
-        self.optimization_interval = 300
-        
-        self.default_weights = {
-            "momentum": 0.35,
-            "value": 0.20,
-            "sentiment": 0.25,
-            "cross_market": 0.20,
-        }
-        
-        self.default_thresholds = {
-            "entry": 0.70,
-            "exit": 0.45,
-            "stop_loss": 0.02,
-            "take_profit": 0.05,
-        }
-    
-    async def optimize_thresholds(self, context: MarketContext) -> Dict[str, float]:
-        """阈值动态优化"""
-        current_time = int(time.time())
-        if current_time - self.last_optimization < self.optimization_interval:
-            cache_key = f"thresholds_{context.volatility_regime}"
-            if cache_key in self.cache:
-                cached = self.cache[cache_key]
-                if current_time - cached["timestamp"] < self.cache_ttl:
-                    return cached["thresholds"]
-        
-        # 基于规则的阈值调整
-        result = self._rule_based_threshold_adjustment(context)
-        
-        cache_key = f"thresholds_{context.volatility_regime}"
-        self.cache[cache_key] = {
-            "thresholds": result,
-            "timestamp": current_time
-        }
-        self.last_optimization = current_time
-        
-        return result
-    
-    async def optimize_weights(self, strategy_performance: Dict[str, Dict]) -> Dict[str, float]:
-        """策略权重调整"""
-        return self._rule_based_weight_adjustment(strategy_performance)
-    
-    def _rule_based_threshold_adjustment(self, context: MarketContext) -> Dict[str, float]:
-        """基于规则的阈值调整"""
-        thresholds = self.default_thresholds.copy()
-        
-        # 高波动环境调整
+    def _adjust_for_market_regime(self, score: float, context: MarketContext) -> float:
+        """根据市场环境调整评分"""
+        # 高波动环境降低极端评分
         if context.volatility_regime == "high":
-            thresholds["entry"] = min(0.80, thresholds["entry"] + 0.05)
-            thresholds["exit"] = min(0.55, thresholds["exit"] + 0.05)
-            thresholds["stop_loss"] = min(0.03, thresholds["stop_loss"] * 1.5)
+            score = 0.5 + (score - 0.5) * 0.8
         
-        # 强趋势环境调整
+        # 强趋势环境增强方向性
         if context.trend_strength > 0.7:
-            thresholds["entry"] = max(0.60, thresholds["entry"] - 0.05)
-            thresholds["take_profit"] = min(0.08, thresholds["take_profit"] * 1.2)
+            score = score * 1.1 if score > 0.5 else score * 0.9
         
-        # 资金流出环境调整
-        if context.capital_flow_direction == "outflow":
-            thresholds["entry"] = min(0.80, thresholds["entry"] + 0.08)
-            thresholds["stop_loss"] = max(0.015, thresholds["stop_loss"] * 0.8)
-        
-        return thresholds
-    
-    def _rule_based_weight_adjustment(self, performance: Dict[str, Dict]) -> Dict[str, float]:
-        """基于规则的权重调整"""
-        weights = self.default_weights.copy()
-        
-        for name, perf in performance.items():
-            win_rate = perf.get("win_rate", 0.5)
-            sharpe = perf.get("sharpe", 1.0)
-            recent_return = perf.get("recent_return", 0)
-            
-            # 表现好的策略增加权重
-            if win_rate > 0.6 and sharpe > 1.0:
-                weights[name] = min(0.5, weights[name] * 1.2)
-            
-            # 表现差的策略降低权重
-            if recent_return < 0 or win_rate < 0.4:
-                weights[name] = max(0.1, weights[name] * 0.8)
-        
-        # 归一化
-        total = sum(weights.values())
-        if total > 0:
-            weights = {k: v / total for k, v in weights.items()}
-        
-        return weights
-
-
-class AlphaScanner:
-    """
-    Agent 3: AlphaScanner - 机会筛选器
-    
-    核心功能：
-    1. 多策略并行扫描（动量/价值/情绪/跨市场传导）
-    2. LightGBM模型实时评分
-    3. GPT-4.1策略优化（阈值动态调整、权重优化）
-    4. Top机会排序和分层（Top5核心仓/Top6-10机会仓/Top11-20观察池）
-    5. 置信度计算和阈值过滤
-    """
-    
-    def __init__(self):
-        self.agent_name = "agent3_scanner"
-        self.bus = MessageBus(self.agent_name)
-        self.consumer = AgentConsumer(
-            agent_name=self.agent_name,
-            topics=["am-hk-processed-data"]
-        )
-        
-        # 核心组件
-        self.factor_scorer = LightGBMFactorScorer()
-        self.strategy_scanner = MultiStrategyScanner()
-        self.strategy_optimizer = StrategyOptimizer()
-        
-        # 候选机会缓存
-        self.candidate_opportunities: Dict[str, Opportunity] = {}
-        self.market_context = MarketContext(
-            timestamp=int(time.time() * 1000),
-            volatility_regime="medium",
-            trend_strength=0.5,
-            market_sentiment=0.0,
-            capital_flow_direction="neutral",
-            btc_momentum=0.0,
-            us_market_state="neutral"
-        )
-        
-        # 配置
-        self.min_confidence = 0.65
-        self.scan_interval = 30  # 30秒扫描一次
-        self.publish_interval = 60  # 60秒发布一次Top机会
-        
-        # 统计
-        self.processed_count = 0
-        self.rejected_count = 0
-        self.running = False
-        
-        logger.info(f"{self.agent_name} initialized (LightGBM + Multi-Strategy + GPT-4.1)")
-    
-    async def start(self):
-        """启动Agent3"""
-        self.running = True
-        logger.info(f"{self.agent_name} started")
-        
-        # 注册消息处理器
-        self.consumer.register_handler("processed_data", self._on_processed_data)
-        
-        # 发布状态
-        self.bus.publish_status({
-            "state": "running",
-            "strategies": ["momentum", "value", "sentiment", "cross_market"],
-            "model": "LightGBM",
-            "optimizer": "GPT-4.1",
-        })
-        
-        # 启动定时任务
-        scan_task = asyncio.create_task(self._scan_loop())
-        publish_task = asyncio.create_task(self._publish_loop())
-        context_task = asyncio.create_task(self._update_context_loop())
-        
-        try:
-            self.consumer.start()
-        except Exception as e:
-            logger.error(f"Consumer error: {e}", exc_info=True)
-        finally:
-            scan_task.cancel()
-            publish_task.cancel()
-            context_task.cancel()
-            await self.stop()
-    
-    async def stop(self):
-        """停止Agent3"""
-        logger.info(f"{self.agent_name} stopping...")
-        self.running = False
-        self.consumer.stop()
-        
-        self.bus.publish_status({
-            "state": "stopped",
-            "processed_count": self.processed_count,
-            "rejected_count": self.rejected_count
-        })
-        self.bus.flush()
-        self.bus.close()
-        
-        logger.info(f"{self.agent_name} stopped")
-    
-    def _on_processed_data(self, key: str, value: Dict, headers: Optional[Dict]):
-        """处理Agent2的因子数据"""
-        start_time = time.time()
-        
-        try:
-            symbol = value.get("symbol", key)
-            market = value.get("market", "unknown")
-            factors = value.get("factors", {})
-            cross_signals = value.get("cross_market_signals", [])
-            timestamp = value.get("timestamp", int(time.time() * 1000))
-            
-            # 1. 执行多策略扫描
-            strategy_scores = self.strategy_scanner.scan_all(
-                symbol, factors, cross_signals, self.market_context
-            )
-            
-            # 2. LightGBM综合评分
-            lgbm_score = self.factor_scorer.score(factors, self.market_context)
-            
-            # 3. 计算综合方向和置信度
-            direction, confidence = self._calculate_composite_signal(
-                strategy_scores, lgbm_score
-            )
-            
-            # 4. 阈值过滤
-            if confidence < self.min_confidence or direction == Direction.HOLD:
-                self.rejected_count += 1
-                return
-            
-            # 5. 构建机会对象
-            opportunity = Opportunity(
-                symbol=symbol,
-                market=market,
-                timestamp=timestamp,
-                rank=0,  # 稍后排序时确定
-                pool=OpportunityPool.REJECTED,  # 稍后确定
-                direction=direction,
-                confidence=confidence,
-                score=lgbm_score,
-                strategy_scores=strategy_scores,
-                strategy_weights={
-                    "momentum": 0.35,
-                    "value": 0.20,
-                    "sentiment": 0.25,
-                    "cross_market": 0.20,
-                },
-                factors=factors,
-                cross_market_signals=cross_signals,
-                reasoning=self._generate_reasoning(symbol, strategy_scores, direction),
-                thresholds=self.strategy_optimizer.default_thresholds.copy(),
-                processing_time_ms=(time.time() - start_time) * 1000,
-                model_version=self.factor_scorer.model_version
-            )
-            
-            # 6. 缓存候选机会
-            self.candidate_opportunities[symbol] = opportunity
-            self.processed_count += 1
-            
-            if self.processed_count % 100 == 0:
-                logger.info(f"Processed {self.processed_count} messages, "
-                           f"rejected {self.rejected_count}, "
-                           f"candidates {len(self.candidate_opportunities)}")
-            
-        except Exception as e:
-            logger.error(f"Error processing data for {key}: {e}", exc_info=True)
-    
-    def _calculate_composite_signal(self, strategy_scores: Dict[str, StrategyScore],
-                                   lgbm_score: float) -> Tuple[Direction, float]:
-        """计算综合信号方向和置信度"""
-        # 基于策略评分计算加权方向
-        buy_score = 0.0
-        sell_score = 0.0
-        total_weight = 0.0
-        
-        weights = {
-            "momentum": 0.35,
-            "value": 0.20,
-            "sentiment": 0.25,
-            "cross_market": 0.20,
-        }
-        
-        for name, score in strategy_scores.items():
-            weight = weights.get(name, 0.25)
-            if score.direction == Direction.BUY:
-                buy_score += score.normalized_score * weight * score.confidence
-            elif score.direction == Direction.SELL:
-                sell_score += score.normalized_score * weight * score.confidence
-            total_weight += weight
-        
-        # 结合LightGBM评分
-        if lgbm_score > 0.6:
-            buy_score += lgbm_score * 0.3
-        elif lgbm_score < 0.4:
-            sell_score += (1 - lgbm_score) * 0.3
-        
-        # 确定方向
-        if buy_score > sell_score * 1.5 and buy_score > 0.3:
-            direction = Direction.BUY
-            confidence = min(buy_score, 0.95)
-        elif sell_score > buy_score * 1.5 and sell_score > 0.3:
-            direction = Direction.SELL
-            confidence = min(sell_score, 0.95)
-        else:
-            direction = Direction.HOLD
-            confidence = max(buy_score, sell_score)
-        
-        return direction, confidence
-    
-    def _generate_reasoning(self, symbol: str, strategy_scores: Dict[str, StrategyScore],
-                           direction: Direction) -> str:
-        """生成交易推理"""
-        reasons = []
-        
-        # 选择得分最高的策略作为主要原因
-        best_strategy = max(strategy_scores.items(), key=lambda x: x[1].normalized_score)
-        reasons.append(f"{best_strategy[0]}:{best_strategy[1].reasoning}")
-        
-        # 跨市场信号
-        cross_score = strategy_scores.get("cross_market")
-        if cross_score and cross_score.normalized_score > 0.5:
-            if "Layer1" in cross_score.reasoning:
-                reasons.append("BTC传导")
-            if "Layer2" in cross_score.reasoning:
-                reasons.append("美股确认")
-        
-        # 资金流向
-        sentiment_score = strategy_scores.get("sentiment")
-        if sentiment_score and "北水" in sentiment_score.reasoning:
-            if "强势" in sentiment_score.reasoning:
-                reasons.append("北水流入")
-            elif "弱势" in sentiment_score.reasoning:
-                reasons.append("北水流出")
-        
-        return ";".join(reasons)
-    
-    async def _scan_loop(self):
-        """定期扫描循环"""
-        while self.running:
-            try:
-                # 触发阈值优化
-                optimized_thresholds = await self.strategy_optimizer.optimize_thresholds(
-                    self.market_context
-                )
-                self.min_confidence = optimized_thresholds["entry"]
-                
-                await asyncio.sleep(self.scan_interval)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Scan loop error: {e}")
-                await asyncio.sleep(10)
-    
-    async def _publish_loop(self):
-        """定期发布Top机会"""
-        while self.running:
-            try:
-                await self._publish_top_opportunities()
-                await asyncio.sleep(self.publish_interval)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Publish loop error: {e}")
-                await asyncio.sleep(10)
-    
-    async def _publish_top_opportunities(self):
-        """发布Top交易机会"""
-        if not self.candidate_opportunities:
-            return
-        
-        # 获取所有候选机会
-        opportunities = list(self.candidate_opportunities.values())
-        
-        # 按置信度排序
-        opportunities.sort(key=lambda x: x.confidence, reverse=True)
-        
-        # 分层
-        for i, opp in enumerate(opportunities):
-            opp.rank = i + 1
-            if i < 5:
-                opp.pool = OpportunityPool.TOP5_CORE
-            elif i < 10:
-                opp.pool = OpportunityPool.TOP6_10_OPPORTUNITY
-            elif i < 20:
-                opp.pool = OpportunityPool.TOP11_20_OBSERVATION
-            else:
-                opp.pool = OpportunityPool.REJECTED
-        
-        # 发布Top 20
-        top_opportunities = [opp for opp in opportunities[:20] 
-                            if opp.pool != OpportunityPool.REJECTED]
-        
-        for opp in top_opportunities:
-            try:
-                # 发布到Kafka
-                self.bus.send(
-                    topic="am-hk-trading-opportunities",
-                    key=opp.symbol,
-                    value=opp.to_dict()
-                )
-                
-                logger.info(f"Published opportunity: {opp.symbol} "
-                           f"rank={opp.rank} pool={opp.pool.value} "
-                           f"direction={opp.direction.value} "
-                           f"confidence={opp.confidence:.3f}")
-                
-            except Exception as e:
-                logger.error(f"Error publishing opportunity for {opp.symbol}: {e}")
-        
-        # 清空已发布的候选
-        published_symbols = {opp.symbol for opp in top_opportunities}
-        self.candidate_opportunities = {
-            k: v for k, v in self.candidate_opportunities.items()
-            if k not in published_symbols
-        }
-        
-        self.bus.flush()
-        
-        logger.info(f"Published {len(top_opportunities)} opportunities, "
-                   f"remaining candidates: {len(self.candidate_opportunities)}")
-    
-    async def _update_context_loop(self):
-        """定期更新市场环境上下文"""
-        while self.running:
-            try:
-                self._update_market_context()
-                await asyncio.sleep(60)  # 每分钟更新
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Context update error: {e}")
-                await asyncio.sleep(10)
-    
-    def _update_market_context(self):
-        """更新市场环境上下文"""
-        # 基于候选机会统计市场环境
-        if not self.candidate_opportunities:
-            return
-        
-        buy_count = sum(1 for opp in self.candidate_opportunities.values()
-                       if opp.direction == Direction.BUY)
-        sell_count = sum(1 for opp in self.candidate_opportunities.values()
-                        if opp.direction == Direction.SELL)
-        total = len(self.candidate_opportunities)
-        
-        # 市场情绪
-        if total > 0:
-            sentiment = (buy_count - sell_count) / total
-            self.market_context.market_sentiment = sentiment
-        
-        # 波动率状态（基于机会数量）
-        if total > 50:
-            self.market_context.volatility_regime = "high"
-        elif total > 20:
-            self.market_context.volatility_regime = "medium"
-        else:
-            self.market_context.volatility_regime = "low"
-        
-        # 趋势强度
-        if buy_count > sell_count * 2:
-            self.market_context.trend_strength = 0.8
-            self.market_context.capital_flow_direction = "inflow"
-        elif sell_count > buy_count * 2:
-            self.market_context.trend_strength = 0.8
-            self.market_context.capital_flow_direction = "outflow"
-        else:
-            self.market_context.trend_strength = 0.5
-            self.market_context.capital_flow_direction = "neutral"
-        
-        self.market_context.timestamp = int(time.time() * 1000)
-        
-        logger.debug(f"Market context updated: volatility={self.market_context.volatility_regime}, "
-                    f"sentiment={self.market_context.market_sentiment:+.2f}")
-
-
-if __name__ == "__main__":
-    scanner = AlphaScanner()
-    asyncio.run(scanner.start())
+        return max(0.0, min(1.0, score))

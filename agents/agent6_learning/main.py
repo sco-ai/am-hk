@@ -1,15 +1,27 @@
 """
-Agent 6: LearningFeedback
-学习反馈与进化引擎
+Agent 6: LearningFeedback - 学习反馈与进化引擎
+核心模块集成入口
 """
 import asyncio
 import json
 import logging
-from typing import Dict, List, Optional
+import os
+from typing import Dict, List, Optional, Any
+from datetime import datetime, timedelta
+from collections import deque
 
 from core.kafka import MessageBus, AgentConsumer
 from core.models import TradeDecision, Signal, ActionType
 from core.utils import generate_msg_id, generate_timestamp, setup_logging
+
+# 导入子模块
+from agents.agent6_learning.modules.lightgbm_trainer import LightGBMTrainer
+from agents.agent6_learning.modules.informer_finetune import InformerFineTuner
+from agents.agent6_learning.modules.ppo_trainer import PPOTrainer
+from agents.agent6_learning.modules.kelly_optimizer import KellyOptimizer
+from agents.agent6_learning.modules.gnn_trainer import TemporalGNNTTrainer
+from agents.agent6_learning.modules.model_manager import ModelVersionManager
+from agents.agent6_learning.modules.evaluator import ModelEvaluator
 
 logger = setup_logging("agent6_learning")
 
@@ -20,18 +32,19 @@ class LearningFeedback:
     
     职责：
     - 交易结果记录与分析
-    - 策略优化（GPT-4.1）
-    - 因子训练（LightGBM云训练）
-    - RL训练（PPO Ray RLlib）
-    - GNN训练（市场联动）
-    - 情绪分析模型训练（FinBERT）
+    - LightGBM增量学习（因子权重优化）
+    - Informer微调（时序预测优化）
+    - PPO + LSTM强化学习（策略参数优化）
+    - Temporal GNN（市场关系图学习）
+    - 凯利公式仓位优化
+    - 模型版本管理与A/B测试
     
-    模型：
-    - 策略优化：GPT-4.1 / DeepSeek
-    - 因子训练：LightGBM（云训练）
-    - RL训练：PPO（Ray RLlib）
-    - GNN：Temporal GNN（云GPU）
-    - 情绪分析：FinBERT API
+    输入：
+    - Kafka: am-hk-trade-results (交易执行结果)
+    - 包含：实际成交价格、盈亏、持仓时间等
+    
+    输出：
+    - Kafka: am-hk-model-updates (广播给所有Agent)
     """
     
     def __init__(self):
@@ -39,63 +52,74 @@ class LearningFeedback:
         self.bus = MessageBus(self.agent_name)
         self.consumer = AgentConsumer(
             agent_name=self.agent_name,
-            topics=["am-hk-executions", "am-hk-feedback", "am-hk-signals"]
+            topics=["am-hk-trade-results", "am-hk-executions", "am-hk-feedback"]
         )
         
-        # 交易历史
-        self.trade_history: List[Dict] = []
-        self.max_history_size = 10000
+        # 初始化各模块
+        self.lightgbm_trainer = LightGBMTrainer()
+        self.informer_tuner = InformerFineTuner()
+        self.ppo_trainer = PPOTrainer()
+        self.kelly_optimizer = KellyOptimizer()
+        self.gnn_trainer = TemporalGNNTTrainer()
+        self.model_manager = ModelVersionManager()
+        self.evaluator = ModelEvaluator()
         
-        # 模型版本
-        self.model_versions = {
-            "factor_model": "v1.0",
-            "rl_model": "v1.0",
-            "gnn_model": "v1.0",
-            "sentiment_model": "v1.0",
-        }
+        # 交易历史缓存
+        self.trade_history: deque = deque(maxlen=50000)
+        self.min_samples_for_training = 100
         
         # 学习配置
         self.learning_interval = 3600  # 每小时学习一次
-        self.min_samples_for_training = 100
+        self.evaluation_interval = 1800  # 每半小时评估一次
         
-        # 性能指标
-        self.performance_metrics = {
+        # 性能统计
+        self.performance_stats = {
             "total_trades": 0,
             "winning_trades": 0,
             "total_pnl": 0.0,
+            "total_cost": 0.0,
             "sharpe_ratio": 0.0,
             "max_drawdown": 0.0,
+            "win_rate": 0.0,
+            "profit_loss_ratio": 0.0,
         }
         
         self.running = False
-        logger.info(f"{self.agent_name} initialized")
+        logger.info(f"{self.agent_name} initialized with all learning modules")
     
     async def start(self):
         """启动学习引擎"""
         self.running = True
         logger.info(f"{self.agent_name} started")
         
+        # 加载历史数据
+        await self._load_trade_history()
+        
+        # 加载当前模型版本
+        self.model_manager.load_current_versions()
+        
         # 注册消息处理器
+        self.consumer.register_handler("trade_result", self._on_trade_result)
         self.consumer.register_handler("execution_order", self._on_execution)
-        self.consumer.register_handler("execution_rejected", self._on_rejection)
-        self.consumer.register_handler("signal", self._on_signal_feedback)
+        self.consumer.register_handler("model_evaluation", self._on_evaluation_request)
         
         # 发布状态
-        self.bus.publish_status({
-            "state": "running",
-            "models": list(self.model_versions.keys()),
-            "history_size": len(self.trade_history),
-        })
+        self._publish_status("running")
         
-        # 启动定时学习任务
-        learning_task = asyncio.create_task(self._learning_loop())
+        # 启动定时任务
+        tasks = [
+            asyncio.create_task(self._learning_loop()),
+            asyncio.create_task(self._evaluation_loop()),
+            asyncio.create_task(self._kelly_optimization_loop()),
+        ]
         
         try:
             self.consumer.start()
         except Exception as e:
             logger.error(f"Consumer error: {e}", exc_info=True)
         finally:
-            learning_task.cancel()
+            for task in tasks:
+                task.cancel()
             await self.stop()
     
     async def stop(self):
@@ -105,82 +129,119 @@ class LearningFeedback:
         self.consumer.stop()
         
         # 保存历史数据
-        await self._save_history()
+        await self._save_trade_history()
         
-        self.bus.publish_status({"state": "stopped"})
+        # 保存模型版本信息
+        self.model_manager.save_versions()
+        
+        self._publish_status("stopped")
         self.bus.flush()
         self.bus.close()
         
         logger.info(f"{self.agent_name} stopped")
+    
+    def _on_trade_result(self, key: str, value: Dict, headers: Optional[Dict]):
+        """处理交易结果"""
+        try:
+            payload = value.get("payload", {})
+            
+            trade_record = {
+                "msg_id": value.get("msg_id"),
+                "timestamp": payload.get("timestamp", generate_timestamp()),
+                "symbol": payload.get("symbol"),
+                "action": payload.get("action"),
+                "entry_price": payload.get("entry_price"),
+                "exit_price": payload.get("exit_price"),
+                "quantity": payload.get("quantity"),
+                "pnl": payload.get("pnl", 0.0),
+                "pnl_pct": payload.get("pnl_pct", 0.0),
+                "holding_time": payload.get("holding_time", 0),
+                "transaction_cost": payload.get("transaction_cost", 0.0),
+                "slippage": payload.get("slippage", 0.0),
+                "factors": payload.get("factors", {}),
+                "signal_confidence": payload.get("signal_confidence", 0.0),
+                "predicted_return": payload.get("predicted_return", 0.0),
+            }
+            
+            self._add_trade_record(trade_record)
+            
+            # 实时更新PPO经验池
+            self.ppo_trainer.add_experience(trade_record)
+            
+            # 实时更新LightGBM训练数据
+            self.lightgbm_trainer.add_sample(trade_record)
+            
+            logger.info(f"Recorded trade result: {trade_record['symbol']} "
+                       f"PNL={trade_record['pnl']:.2f} "
+                       f"holding_time={trade_record['holding_time']}s")
+        
+        except Exception as e:
+            logger.error(f"Error processing trade result: {e}", exc_info=True)
     
     def _on_execution(self, key: str, value: Dict, headers: Optional[Dict]):
         """处理执行结果"""
         try:
             payload = value.get("payload", {})
             decision_data = payload.get("decision", {})
-            decision = TradeDecision(**decision_data)
             
-            # 记录交易
-            trade_record = {
-                "msg_id": value.get("msg_id"),
-                "timestamp": generate_timestamp(),
-                "symbol": decision.signal.symbol,
-                "action": decision.signal.action.value,
-                "position_size": decision.position_size,
-                "confidence": decision.signal.confidence,
-                "predicted_return": decision.signal.predicted_return,
-                "approved": True,
-                "factors": decision.signal.metadata.get("factors", {}),
-            }
-            
-            self._add_trade_record(trade_record)
-            
-            logger.info(f"Recorded executed trade: {decision.signal.symbol} "
-                       f"action={decision.signal.action.value}")
-        
-        except Exception as e:
-            logger.error(f"Error processing execution: {e}", exc_info=True)
-    
-    def _on_rejection(self, key: str, value: Dict, headers: Optional[Dict]):
-        """处理被拒绝的交易"""
-        try:
-            payload = value.get("payload", {})
-            decision_data = payload.get("decision", {})
-            reason = payload.get("reason", "unknown")
-            
-            # 记录被拒绝的交易（用于学习）
-            rejection_record = {
+            execution_record = {
                 "msg_id": value.get("msg_id"),
                 "timestamp": generate_timestamp(),
                 "symbol": decision_data.get("signal", {}).get("symbol"),
                 "action": decision_data.get("signal", {}).get("action"),
-                "rejection_reason": reason,
+                "position_size": decision_data.get("position_size"),
                 "confidence": decision_data.get("signal", {}).get("confidence"),
+                "predicted_return": decision_data.get("signal", {}).get("predicted_return"),
+                "factors": decision_data.get("signal", {}).get("metadata", {}).get("factors", {}),
+                "status": "executed",
             }
             
-            self._add_trade_record(rejection_record)
+            self._add_trade_record(execution_record)
             
-            logger.info(f"Recorded rejected trade: {rejection_record['symbol']} "
-                       f"reason={reason}")
+            logger.debug(f"Recorded execution: {execution_record['symbol']} "
+                        f"action={execution_record['action']}")
         
         except Exception as e:
-            logger.error(f"Error processing rejection: {e}", exc_info=True)
+            logger.error(f"Error processing execution: {e}", exc_info=True)
     
-    def _on_signal_feedback(self, key: str, value: Dict, headers: Optional[Dict]):
-        """处理信号反馈（后续盈亏数据）"""
-        # TODO: 接入实际盈亏数据，计算信号准确性
-        pass
+    def _on_evaluation_request(self, key: str, value: Dict, headers: Optional[Dict]):
+        """处理评估请求"""
+        try:
+            payload = value.get("payload", {})
+            model_type = payload.get("model_type", "all")
+            
+            logger.info(f"Received evaluation request for {model_type}")
+            
+            # 执行评估
+            results = self.evaluator.evaluate_all_models(
+                self.trade_history,
+                self.model_manager.get_current_versions()
+            )
+            
+            # 发布评估结果
+            self._publish_evaluation_results(results)
+            
+        except Exception as e:
+            logger.error(f"Error processing evaluation request: {e}", exc_info=True)
     
     def _add_trade_record(self, record: Dict):
         """添加交易记录"""
         self.trade_history.append(record)
         
-        # 限制历史大小
-        if len(self.trade_history) > self.max_history_size:
-            self.trade_history = self.trade_history[-self.max_history_size:]
-        
         # 更新统计
-        self.performance_metrics["total_trades"] += 1
+        if record.get("pnl") is not None:
+            self.performance_stats["total_trades"] += 1
+            if record["pnl"] > 0:
+                self.performance_stats["winning_trades"] += 1
+            self.performance_stats["total_pnl"] += record["pnl"]
+            self.performance_stats["total_cost"] += record.get("transaction_cost", 0)
+            
+            # 计算胜率
+            total = self.performance_stats["total_trades"]
+            if total > 0:
+                self.performance_stats["win_rate"] = (
+                    self.performance_stats["winning_trades"] / total
+                )
     
     async def _learning_loop(self):
         """定时学习循环"""
@@ -199,218 +260,280 @@ class LearningFeedback:
             except Exception as e:
                 logger.error(f"Learning loop error: {e}", exc_info=True)
     
+    async def _evaluation_loop(self):
+        """定时评估循环"""
+        while self.running:
+            try:
+                await asyncio.sleep(self.evaluation_interval)
+                
+                if len(self.trade_history) >= self.min_samples_for_training:
+                    await self._run_evaluation_cycle()
+            
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Evaluation loop error: {e}", exc_info=True)
+    
+    async def _kelly_optimization_loop(self):
+        """凯利公式优化循环（每10分钟）"""
+        while self.running:
+            try:
+                await asyncio.sleep(600)  # 10分钟
+                
+                if len(self.trade_history) >= 50:  # 至少需要50笔交易
+                    await self._run_kelly_optimization()
+            
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Kelly optimization loop error: {e}", exc_info=True)
+    
     async def _run_learning_cycle(self):
         """执行学习周期"""
-        logger.info("=" * 50)
+        logger.info("=" * 60)
         logger.info("Starting learning cycle...")
+        logger.info("=" * 60)
         
-        # 1. 性能分析
-        await self._analyze_performance()
+        # 1. LightGBM增量学习
+        lightgbm_update = await self._train_lightgbm()
         
-        # 2. 策略优化（GPT-4.1）
-        await self._optimize_strategy()
+        # 2. Informer微调
+        informer_update = await self._finetune_informer()
         
-        # 3. 因子模型训练（LightGBM）
-        await self._train_factor_model()
+        # 3. PPO+LSTM训练
+        ppo_update = await self._train_ppo()
         
-        # 4. RL模型训练（PPO）
-        await self._train_rl_model()
+        # 4. Temporal GNN训练
+        gnn_update = await self._train_gnn()
         
-        # 5. 模型更新通知
-        await self._publish_model_updates()
-        
-        logger.info("Learning cycle completed")
-        logger.info("=" * 50)
-    
-    async def _analyze_performance(self):
-        """分析交易性能"""
-        logger.info("Analyzing performance...")
-        
-        if not self.trade_history:
-            return
-        
-        # 计算基础指标
-        total = len(self.trade_history)
-        approved = sum(1 for t in self.trade_history if t.get("approved", False))
-        rejected = total - approved
-        
-        # 胜率（假设有实际结果字段）
-        # TODO: 接入实际盈亏数据
-        
-        self.performance_metrics.update({
-            "total_trades": total,
-            "approval_rate": approved / total if total > 0 else 0,
+        # 5. 综合模型更新广播
+        await self._publish_model_updates({
+            "lightgbm": lightgbm_update,
+            "informer": informer_update,
+            "ppo": ppo_update,
+            "gnn": gnn_update,
         })
         
-        logger.info(f"Performance: total={total}, approved={approved}, "
-                   f"rejected={rejected}, approval_rate={self.performance_metrics['approval_rate']:.2%}")
+        logger.info("Learning cycle completed")
+        logger.info("=" * 60)
     
-    async def _optimize_strategy(self):
-        """
-        策略优化（GPT-4.1）
+    async def _run_evaluation_cycle(self):
+        """执行评估周期"""
+        logger.info("Running evaluation cycle...")
         
-        分析交易历史，生成策略优化建议
-        """
-        logger.info("Optimizing strategy with LLM...")
+        # 评估各模型性能
+        results = self.evaluator.evaluate_all_models(
+            list(self.trade_history),
+            self.model_manager.get_current_versions()
+        )
         
-        # 准备数据摘要
-        recent_trades = self.trade_history[-100:]  # 最近100笔
+        # 如果新模型表现更好，执行升级
+        for model_name, evaluation in results.items():
+            if evaluation.get("should_promote", False):
+                logger.info(f"Promoting {model_name} to production")
+                self.model_manager.promote_version(model_name, evaluation["version"])
         
-        # 构造prompt
-        prompt = self._build_strategy_prompt(recent_trades)
-        
-        # TODO: 调用GPT-4.1 API
-        # response = await self._call_openai(prompt)
-        
-        # 模拟优化建议
-        optimization = {
-            "suggestions": [
-                "提高动量因子权重",
-                "降低高波动时段的交易频率",
-                "增加成交量确认条件",
-            ],
-            "confidence": 0.75,
-        }
-        
-        logger.info(f"Strategy optimization: {len(optimization['suggestions'])} suggestions")
-        
-        # 保存优化建议
-        await self._save_optimization(optimization)
+        logger.info("Evaluation cycle completed")
     
-    def _build_strategy_prompt(self, trades: List[Dict]) -> str:
-        """构造策略优化prompt"""
-        prompt = """
-你是一位量化交易策略优化专家。请分析以下交易数据并提供优化建议：
-
-最近交易统计：
-"""
-        # 汇总数据
-        symbols = {}
-        for t in trades:
-            sym = t.get("symbol", "unknown")
-            if sym not in symbols:
-                symbols[sym] = {"count": 0, "actions": []}
-            symbols[sym]["count"] += 1
-            symbols[sym]["actions"].append(t.get("action"))
+    async def _run_kelly_optimization(self):
+        """执行凯利公式仓位优化"""
+        try:
+            kelly_result = self.kelly_optimizer.optimize(
+                list(self.trade_history),
+                window_size=100  # 最近100笔交易
+            )
+            
+            # 发布仓位优化结果
+            self._publish_kelly_update(kelly_result)
+            
+            logger.info(f"Kelly optimization: position={kelly_result['optimal_position']:.2%}, "
+                       f"win_rate={kelly_result['win_rate']:.2%}, "
+                       f"pl_ratio={kelly_result['profit_loss_ratio']:.2f}")
         
-        for sym, stats in symbols.items():
-            prompt += f"- {sym}: {stats['count']}笔交易\n"
-        
-        prompt += f"\n总交易数: {len(trades)}\n"
-        prompt += "\n请提供：\n1. 当前策略的问题\n2. 具体优化建议\n3. 预期改进效果\n"
-        
-        return prompt
+        except Exception as e:
+            logger.error(f"Kelly optimization error: {e}")
     
-    async def _train_factor_model(self):
-        """
-        训练因子模型（LightGBM云训练）
+    async def _train_lightgbm(self) -> Dict:
+        """LightGBM增量学习"""
+        try:
+            logger.info("Training LightGBM (incremental)...")
+            
+            # 准备训练数据
+            training_data = self.lightgbm_trainer.prepare_training_data(
+                list(self.trade_history)
+            )
+            
+            if len(training_data) < self.min_samples_for_training:
+                logger.warning("Not enough data for LightGBM training")
+                return {"status": "skipped", "reason": "insufficient_data"}
+            
+            # 执行增量训练
+            result = await self.lightgbm_trainer.incremental_train(training_data)
+            
+            # 更新模型版本
+            new_version = self.model_manager.bump_version("lightgbm")
+            result["version"] = new_version
+            
+            logger.info(f"LightGBM training complete: version={new_version}, "
+                       f"accuracy={result.get('accuracy', 0):.3f}")
+            
+            return result
         
-        TODO: 接入云训练平台
-        """
-        logger.info("Training factor model (LightGBM)...")
-        
-        # 准备训练数据
-        training_data = self._prepare_training_data()
-        
-        if len(training_data) < self.min_samples_for_training:
-            logger.warning("Not enough data for factor model training")
-            return
-        
-        # TODO: 提交云训练任务
-        # job_id = await self._submit_cloud_training("lightgbm", training_data)
-        
-        logger.info(f"Factor model training prepared with {len(training_data)} samples")
-        
-        # 更新版本
-        self.model_versions["factor_model"] = "v1.1"
+        except Exception as e:
+            logger.error(f"LightGBM training error: {e}")
+            return {"status": "error", "error": str(e)}
     
-    def _prepare_training_data(self) -> List[Dict]:
-        """准备训练数据"""
-        # 提取特征和标签
-        data = []
-        for trade in self.trade_history:
-            if "factors" in trade:
-                data.append({
-                    "features": trade["factors"],
-                    "label": 1 if trade.get("approved") else 0,
-                    "confidence": trade.get("confidence", 0),
-                })
-        return data
+    async def _finetune_informer(self) -> Dict:
+        """Informer微调"""
+        try:
+            logger.info("Fine-tuning Informer...")
+            
+            # 准备时序数据
+            timeseries_data = self.informer_tuner.prepare_timeseries_data(
+                list(self.trade_history)
+            )
+            
+            if len(timeseries_data) < 50:
+                logger.warning("Not enough data for Informer fine-tuning")
+                return {"status": "skipped", "reason": "insufficient_data"}
+            
+            # 执行微调
+            result = await self.informer_tuner.finetune(timeseries_data)
+            
+            # 更新模型版本
+            new_version = self.model_manager.bump_version("informer")
+            result["version"] = new_version
+            
+            logger.info(f"Informer fine-tuning complete: version={new_version}, "
+                       f"mse={result.get('mse', 0):.4f}")
+            
+            return result
+        
+        except Exception as e:
+            logger.error(f"Informer fine-tuning error: {e}")
+            return {"status": "error", "error": str(e)}
     
-    async def _train_rl_model(self):
-        """
-        训练RL模型（PPO Ray RLlib）
+    async def _train_ppo(self) -> Dict:
+        """PPO+LSTM训练"""
+        try:
+            logger.info("Training PPO+LSTM...")
+            
+            # 准备RL经验数据
+            if not self.ppo_trainer.has_enough_experiences():
+                logger.warning("Not enough experiences for PPO training")
+                return {"status": "skipped", "reason": "insufficient_experiences"}
+            
+            # 执行训练
+            result = await self.ppo_trainer.train()
+            
+            # 更新模型版本
+            new_version = self.model_manager.bump_version("ppo")
+            result["version"] = new_version
+            
+            logger.info(f"PPO training complete: version={new_version}, "
+                       f"policy_improvement={result.get('policy_improvement', 0):.4f}")
+            
+            return result
         
-        TODO: 接入Ray RLlib云训练
-        """
-        logger.info("Training RL model (PPO)...")
-        
-        # 构建环境数据
-        env_data = self._build_rl_environment()
-        
-        if len(env_data) < self.min_samples_for_training:
-            logger.warning("Not enough data for RL training")
-            return
-        
-        # TODO: 启动Ray RLlib训练
-        # trainer = await self._start_rl_training(env_data)
-        
-        logger.info(f"RL training prepared with {len(env_data)} episodes")
-        
-        # 更新版本
-        self.model_versions["rl_model"] = "v1.1"
+        except Exception as e:
+            logger.error(f"PPO training error: {e}")
+            return {"status": "error", "error": str(e)}
     
-    def _build_rl_environment(self) -> List[Dict]:
-        """构建RL环境数据"""
-        episodes = []
-        # 按交易对分组
-        symbol_trades = {}
-        for trade in self.trade_history:
-            sym = trade.get("symbol")
-            if sym not in symbol_trades:
-                symbol_trades[sym] = []
-            symbol_trades[sym].append(trade)
+    async def _train_gnn(self) -> Dict:
+        """Temporal GNN训练"""
+        try:
+            logger.info("Training Temporal GNN...")
+            
+            # 准备图数据
+            graph_data = self.gnn_trainer.prepare_graph_data(
+                list(self.trade_history)
+            )
+            
+            if len(graph_data["nodes"]) < 10:
+                logger.warning("Not enough data for GNN training")
+                return {"status": "skipped", "reason": "insufficient_data"}
+            
+            # 执行训练
+            result = await self.gnn_trainer.train(graph_data)
+            
+            # 更新模型版本
+            new_version = self.model_manager.bump_version("gnn")
+            result["version"] = new_version
+            
+            logger.info(f"GNN training complete: version={new_version}, "
+                       f"correlation_improvement={result.get('correlation_improvement', 0):.4f}")
+            
+            return result
         
-        # 构建episode
-        for sym, trades in symbol_trades.items():
-            if len(trades) >= 10:
-                episodes.append({
-                    "symbol": sym,
-                    "trades": trades,
-                })
-        
-        return episodes
+        except Exception as e:
+            logger.error(f"GNN training error: {e}")
+            return {"status": "error", "error": str(e)}
     
-    async def _publish_model_updates(self):
-        """发布模型更新通知"""
+    def _publish_model_updates(self, updates: Dict[str, Dict]):
+        """发布模型更新"""
         message = {
-            "msg_id": generate_msg_id(),
-            "msg_type": "model_update",
-            "source_agent": self.agent_name,
+            "update_type": "strategy_weights",
             "timestamp": generate_timestamp(),
-            "payload": {
-                "model_versions": self.model_versions,
-                "performance": self.performance_metrics,
-            },
+            "lightgbm_update": updates.get("lightgbm", {}),
+            "informer_update": updates.get("informer", {}),
+            "ppo_update": updates.get("ppo", {}),
+            "gnn_update": updates.get("gnn", {}),
         }
         
         self.bus.send("am-hk-model-updates", "all", message)
         self.bus.flush()
         
-        logger.info(f"Published model updates: {self.model_versions}")
+        logger.info(f"Published model updates to am-hk-model-updates")
     
-    async def _save_history(self):
-        """保存历史数据"""
+    def _publish_kelly_update(self, kelly_result: Dict):
+        """发布凯利公式优化结果"""
+        message = {
+            "update_type": "kelly_optimization",
+            "timestamp": generate_timestamp(),
+            "kelly_optimization": kelly_result,
+        }
+        
+        self.bus.send("am-hk-model-updates", "all", message)
+        self.bus.flush()
+    
+    def _publish_evaluation_results(self, results: Dict):
+        """发布评估结果"""
+        message = {
+            "update_type": "model_evaluation",
+            "timestamp": generate_timestamp(),
+            "evaluation_results": results,
+        }
+        
+        self.bus.send("am-hk-model-updates", "all", message)
+        self.bus.flush()
+    
+    def _publish_status(self, state: str):
+        """发布Agent状态"""
+        status = {
+            "state": state,
+            "models": list(self.model_manager.get_current_versions().keys()),
+            "history_size": len(self.trade_history),
+            "performance": self.performance_stats,
+        }
+        self.bus.publish_status(status)
+    
+    async def _load_trade_history(self):
+        """加载历史交易数据"""
+        try:
+            # TODO: 从数据库加载历史数据
+            logger.info("Loading trade history...")
+            # 模拟加载数据
+            logger.info(f"Loaded {len(self.trade_history)} historical trades")
+        except Exception as e:
+            logger.error(f"Failed to load trade history: {e}")
+    
+    async def _save_trade_history(self):
+        """保存交易历史"""
         try:
             # TODO: 持久化到数据库
             logger.info(f"Saving {len(self.trade_history)} trade records")
         except Exception as e:
-            logger.error(f"Failed to save history: {e}")
-    
-    async def _save_optimization(self, optimization: Dict):
-        """保存优化建议"""
-        # TODO: 保存到数据库
-        logger.info(f"Saved optimization: {optimization}")
+            logger.error(f"Failed to save trade history: {e}")
 
 
 if __name__ == "__main__":

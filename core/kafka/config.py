@@ -16,7 +16,9 @@ class KafkaConfig:
         "factor_data": "am-hk-factor-data",
         "signals": "am-hk-signals",
         "decisions": "am-hk-decisions",
+        "trading_decisions": "am-hk-trading-decisions",  # Agent4 -> Agent5
         "executions": "am-hk-executions",
+        "risk_approved_trades": "am-hk-risk-approved-trades",  # Agent5输出
         
         # Agent 命令
         "agent_commands": "am-hk-agent-commands",
@@ -69,6 +71,8 @@ TOPIC_PARTITIONS = {
     "am-hk-factor-data": 4,
     "am-hk-signals": 3,
     "am-hk-decisions": 2,
+    "am-hk-trading-decisions": 2,    # Agent4输出到Agent5
+    "am-hk-risk-approved-trades": 2, # Agent5输出
     "am-hk-executions": 2,
     "am-hk-agent-commands": 1,       # 命令串行处理
     "am-hk-agent-status": 1,
