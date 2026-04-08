@@ -6,9 +6,11 @@
 Agent1 (MarketHarvester) → Agent2 (DataCurator) → Agent3 (AlphaScanner)
                                                           ↓
 Agent6 (LearningFeedback) ← Agent5 (RiskGuardian) ← Agent4 (TrendOracle)
+        ↑                                               ↓
+        └───────────── Agent7 (PerformanceAnalyzer) ←───┘
 ```
 
-## 6大Agent职责
+## 7大Agent职责
 
 | Agent | 名称 | 职责 | 核心模型 |
 |-------|------|------|----------|
@@ -18,6 +20,7 @@ Agent6 (LearningFeedback) ← Agent5 (RiskGuardian) ← Agent4 (TrendOracle)
 | Agent4 | TrendOracle | 核心决策 | Informer + PPO + GPT-4.1 |
 | Agent5 | RiskGuardian | 风控审批 | 规则 + AI风控 |
 | Agent6 | LearningFeedback | 学习进化 | PPO + GNN + FinBERT |
+| Agent7 | PerformanceAnalyzer | 绩效分析 | 统计分析 + VaR/CVaR |
 
 ## 四大AI能力
 
@@ -92,13 +95,14 @@ python -m agents.agent2_curator.main
 
 ```
 am-hk/
-├── agents/              # 6个Agent实现
+├── agents/              # 7个Agent实现
 │   ├── agent1_harvester/
 │   ├── agent2_curator/
 │   ├── agent3_scanner/
 │   ├── agent4_oracle/
 │   ├── agent5_guardian/
-│   └── agent6_learning/
+│   ├── agent6_learning/
+│   └── agent7_performance/
 ├── core/                # 核心组件
 │   ├── kafka/          # Kafka消息系统
 │   ├── models.py       # 数据模型
