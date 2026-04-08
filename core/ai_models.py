@@ -1,6 +1,6 @@
 """
 AI模型客户端
-集成外部AI服务：Informer、GPT-4.1、DeepSeek等
+集成本地Ollama模型：gemma4等 (GPU加速)
 """
 import json
 import logging

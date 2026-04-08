@@ -1,14 +1,18 @@
 """
 Agent 3: AlphaScanner (机会筛选器) - v3.0 Enhanced
-多策略扫描、LightGBM因子评分、GPT-4.1策略优化、Top机会分层
+多策略扫描、LightGBM因子评分、Ollama本地模型策略优化、Top机会分层
 
 职责：
 - 接收 Agent2 的因子数据（Kafka: am-hk-processed-data）
 - 多策略并行扫描（动量/价值/情绪/跨市场传导）
 - LightGBM模型实时评分
-- GPT-4.1动态阈值优化和策略权重调整
+- Ollama本地模型(gemma4:31b)动态阈值优化和策略权重调整
 - Top机会排序和分层（Top10/Top20交易池生成）
 - 输出交易机会到 Kafka: am-hk-trading-opportunities
+
+模型配置:
+- LightGBM: 本地规则评分器
+- Ollama: gemma4:31b (本地GPU加速)
 """
 import asyncio
 import json
@@ -26,6 +30,7 @@ import pandas as pd
 from core.kafka import MessageBus, AgentConsumer
 from core.models import MarketType, ActionType
 from core.ai_models import ModelFactory, LLMTradingAnalyzer
+from core.ollama_adapter import get_ollama  # Ollama本地模型
 from core.utils import generate_msg_id, generate_timestamp, setup_logging
 from core.config import settings
 
@@ -378,3 +383,174 @@ class LightGBMFactorScorer:
             score = score * 1.1 if score > 0.5 else score * 0.9
         
         return max(0.0, min(1.0, score))
+
+
+class AlphaScanner:
+    """
+    Agent 3: AlphaScanner (机会筛选器) - v3.0 Ollama版本
+    
+    使用本地Ollama模型(gemma4:31b)进行策略优化和权重调整
+    """
+    
+    def __init__(self):
+        self.scorer = LightGBMFactorScorer()
+        self.ollama = get_ollama()  # Ollama本地模型
+        self.logger = logger
+        
+    async def optimize_strategy_weights(
+        self,
+        opportunities: List[Opportunity],
+        market_context: MarketContext
+    ) -> Dict[str, float]:
+        """
+        使用Ollama优化策略权重
+        
+        Args:
+            opportunities: 当前机会列表
+            market_context: 市场环境上下文
+            
+        Returns:
+            优化后的策略权重字典
+        """
+        # 构建分析prompt
+        prompt = f"""作为量化策略优化专家，请根据当前市场环境优化策略权重。
+
+{market_context.to_prompt_context()}
+
+当前候选机会数量: {len(opportunities)}
+
+请输出JSON格式:
+{{
+    "momentum_weight": 0.25,
+    "value_weight": 0.20,
+    "sentiment_weight": 0.25,
+    "cross_market_weight": 0.30,
+    "reasoning": "简要说明"
+}}
+"""
+        
+        try:
+            result = self.ollama.analyze(
+                prompt=prompt,
+                system="你是专业的量化交易策略优化专家，只输出JSON格式结果。",
+                json_mode=True
+            )
+            
+            parsed = result.get("parsed", {})
+            
+            weights = {
+                "momentum": parsed.get("momentum_weight", 0.25),
+                "value": parsed.get("value_weight", 0.20),
+                "sentiment": parsed.get("sentiment_weight", 0.25),
+                "cross_market": parsed.get("cross_market_weight", 0.30),
+            }
+            
+            self.logger.info(f"Ollama策略权重优化完成: {weights}")
+            return weights
+            
+        except Exception as e:
+            self.logger.error(f"Ollama优化失败，使用默认权重: {e}")
+            # 默认权重
+            return {
+                "momentum": 0.25,
+                "value": 0.20,
+                "sentiment": 0.25,
+                "cross_market": 0.30,
+            }
+    
+    async def analyze_opportunity(
+        self,
+        symbol: str,
+        factors: Dict[str, float],
+        market_context: MarketContext
+    ) -> Opportunity:
+        """
+        分析单个交易机会 (使用Ollama增强推理)
+        
+        Args:
+            symbol: 股票代码
+            factors: 因子数据
+            market_context: 市场环境
+            
+        Returns:
+            Opportunity对象
+        """
+        start_time = time.time()
+        
+        # 1. LightGBM基础评分
+        base_score = self.scorer.score(factors, market_context)
+        
+        # 2. 使用Ollama进行深度分析
+        prompt = f"""分析港股 {symbol} 的交易机会。
+
+市场环境:
+{market_context.to_prompt_context()}
+
+关键因子:
+- 短期动量(5m): {factors.get('price_momentum_5m', 0):.2f}%
+- RSI: {factors.get('rsi_14', 50):.1f}
+- 主力资金比率: {factors.get('main_force_ratio', 0):.2f}
+- 北水强度: {factors.get('northbound_strength', 0):.2f}
+- Layer1信号: {factors.get('layer1_signal', 0):.2f}
+- Layer2确认: {factors.get('layer2_confirm', 0):.2f}
+
+基础评分: {base_score:.2f}
+
+请输出JSON格式:
+{{
+    "direction": "BUY/SELL/HOLD",
+    "confidence": 0.75,
+    "reasoning": "简要分析理由",
+    "risk_factors": ["风险1", "风险2"]
+}}
+"""
+        
+        try:
+            result = self.ollama.analyze(
+                prompt=prompt,
+                system="你是专业的港股量化分析师，只输出JSON格式结果。",
+                json_mode=True
+            )
+            
+            parsed = result.get("parsed", {})
+            
+            opp = Opportunity(
+                symbol=symbol,
+                market="HK",
+                timestamp=generate_timestamp(),
+                rank=0,  # 后续排序
+                pool=OpportunityPool.TOP6_10_OPPORTUNITY,
+                direction=Direction(parsed.get("direction", "HOLD")),
+                confidence=parsed.get("confidence", 0.5),
+                score=base_score,
+                factors=factors,
+                reasoning=parsed.get("reasoning", ""),
+                processing_time_ms=(time.time() - start_time) * 1000,
+                model_version="v3.0-ollama"
+            )
+            
+            return opp
+            
+        except Exception as e:
+            self.logger.error(f"Ollama分析失败 {symbol}: {e}")
+            # Fallback: 使用基础评分
+            direction = Direction.BUY if base_score > 0.6 else Direction.SELL if base_score < 0.4 else Direction.HOLD
+            
+            return Opportunity(
+                symbol=symbol,
+                market="HK",
+                timestamp=generate_timestamp(),
+                rank=0,
+                pool=OpportunityPool.TOP6_10_OPPORTUNITY,
+                direction=direction,
+                confidence=abs(base_score - 0.5) * 2,
+                score=base_score,
+                factors=factors,
+                reasoning="基础评分模式(OLLAMA_FALLBACK)",
+                processing_time_ms=(time.time() - start_time) * 1000,
+                model_version="v3.0-fallback"
+            )
+    
+    def health_check(self) -> bool:
+        """检查Ollama服务状态"""
+        return self.ollama.health_check()
