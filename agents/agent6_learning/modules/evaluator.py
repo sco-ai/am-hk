@@ -130,7 +130,7 @@ class ModelEvaluator:
         feature_importance = trade_history[-1].get("factors", {}) if trade_history else {}
         
         # 判断是否需要升级
-        should_promote = (
+        should_promote = bool(
             metrics.accuracy > self.thresholds["accuracy"] and
             metrics.win_rate > self.thresholds["win_rate"]
         )
@@ -190,7 +190,7 @@ class ModelEvaluator:
         )
         directional_accuracy = directional_correct / len(trade_history) if trade_history else 0
         
-        should_promote = mae < 0.05 and directional_accuracy > 0.55
+        should_promote = bool(mae < 0.05 and directional_accuracy > 0.55)
         
         return {
             "version": version,
@@ -248,7 +248,7 @@ class ModelEvaluator:
         avg_loss = abs(np.mean([r for r in returns if r <= 0])) if wins < len(returns) else 1
         pl_ratio = avg_win / avg_loss if avg_loss > 0 else 1
         
-        should_promote = (
+        should_promote = bool(
             sharpe > self.thresholds["sharpe_ratio"] and
             win_rate > self.thresholds["win_rate"] and
             max_drawdown < self.thresholds["max_drawdown"]
@@ -305,16 +305,16 @@ class ModelEvaluator:
         avg_correlation = np.mean(correlations) if correlations else 0
         
         # GNN效果：高相关性意味着关系学习有价值
-        should_promote = avg_correlation > 0.3
+        should_promote = bool(avg_correlation > 0.3)
         
         return {
             "version": version,
             "status": "success",
             "metrics": {
-                "avg_correlation": round(avg_correlation, 4),
-                "num_symbols": len(symbol_list),
-                "num_correlations": len(correlations),
-                "max_correlation": round(max(correlations), 4) if correlations else 0,
+                "avg_correlation": float(round(avg_correlation, 4)),
+                "num_symbols": int(len(symbol_list)),
+                "num_correlations": int(len(correlations)),
+                "max_correlation": float(round(max(correlations), 4)) if correlations else 0,
             },
             "should_promote": should_promote,
         }

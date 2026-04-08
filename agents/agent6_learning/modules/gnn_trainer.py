@@ -12,6 +12,9 @@ from core.utils import setup_logging
 
 logger = setup_logging("gnn_trainer")
 
+TORCH_AVAILABLE = False
+TemporalGNN = None
+
 try:
     import torch
     import torch.nn as nn
@@ -44,43 +47,46 @@ try:
             
             # 输出层
             self.output = nn.Linear(hidden_dim, 1)
+            
+            self.relu = nn.ReLU()
+            self.dropout = nn.Dropout(0.2)
         
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(0.2)
-    
-    def forward(self, x, adj_matrix, hidden=None):
-        """
-        前向传播
-        
-        Args:
-            x: 节点特征 [batch, num_nodes, feature_dim]
-            adj_matrix: 邻接矩阵 [num_nodes, num_nodes]
-            hidden: LSTM隐藏状态
-        """
-        batch_size = x.size(0)
-        
-        # 图卷积
-        h = self.gcn1(x)  # [batch, num_nodes, hidden_dim]
-        h = self.relu(h)
-        h = self.dropout(h)
-        
-        # 消息传递（简化）
-        h = torch.bmm(adj_matrix.unsqueeze(0).expand(batch_size, -1, -1), h)
-        
-        h = self.gcn2(h)
-        h = self.relu(h)
-        
-        # 聚合节点特征
-        h = h.mean(dim=1)  # [batch, hidden_dim]
-        h = h.unsqueeze(1)  # [batch, 1, hidden_dim]
-        
-        # LSTM时序处理
-        lstm_out, hidden = self.lstm(h, hidden)
-        
-        # 输出
-        out = self.output(lstm_out[:, -1, :])
-        
-        return out, hidden
+        def forward(self, x, adj_matrix, hidden=None):
+            """
+            前向传播
+            
+            Args:
+                x: 节点特征 [batch, num_nodes, feature_dim]
+                adj_matrix: 邻接矩阵 [num_nodes, num_nodes]
+                hidden: LSTM隐藏状态
+            """
+            batch_size = x.size(0)
+            
+            # 图卷积
+            h = self.gcn1(x)  # [batch, num_nodes, hidden_dim]
+            h = self.relu(h)
+            h = self.dropout(h)
+            
+            # 消息传递（简化）
+            h = torch.bmm(adj_matrix.unsqueeze(0).expand(batch_size, -1, -1), h)
+            
+            h = self.gcn2(h)
+            h = self.relu(h)
+            
+            # 聚合节点特征
+            h = h.mean(dim=1)  # [batch, hidden_dim]
+            h = h.unsqueeze(1)  # [batch, 1, hidden_dim]
+            
+            # LSTM时序处理
+            lstm_out, hidden = self.lstm(h, hidden)
+            
+            # 输出
+            out = self.output(lstm_out[:, -1, :])
+            
+            return out, hidden
+
+except ImportError:
+    logger.warning("PyTorch not installed, using mock implementation")
 
 
 class TemporalGNNTTrainer:
@@ -109,7 +115,7 @@ class TemporalGNNTTrainer:
         # 网络
         self.feature_dim = 10
         self.hidden_dim = 64
-        self.model: Optional[TemporalGNN] = None
+        self.model = None
         
         if TORCH_AVAILABLE:
             self._init_model()

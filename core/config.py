@@ -55,6 +55,14 @@ class Settings(BaseSettings):
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
     
+    # Qwen2.5 (Track B主模型)
+    QWEN_API_KEY: str = ""
+    QWEN_API_URL: str = "https://api.openai.com/v1"  # 兼容OpenAI格式
+    
+    # Kimi (Track B备选模型)
+    KIMI_API_KEY: str = ""
+    KIMI_API_URL: str = "https://api.moonshot.cn/v1"
+    
     # Informer时序预测
     INFORMER_API_URL: str = ""
     INFORMER_API_KEY: str = ""
@@ -140,6 +148,8 @@ class Settings(BaseSettings):
         config_map = {
             "openai": bool(self.OPENAI_API_KEY),
             "deepseek": bool(self.DEEPSEEK_API_KEY),
+            "qwen": bool(self.QWEN_API_KEY),
+            "kimi": bool(self.KIMI_API_KEY),
             "informer": bool(self.INFORMER_API_URL),
             "n-hits": bool(self.NHITS_API_URL),
             "rl": bool(self.RL_API_URL),
