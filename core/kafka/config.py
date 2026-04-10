@@ -7,7 +7,7 @@ from typing import Dict, List
 
 class KafkaConfig:
     """Kafka 配置"""
-    BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9112")
+    BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
     
     # Topics 定义
     TOPICS = {

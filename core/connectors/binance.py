@@ -75,6 +75,7 @@ class BinanceConnector:
         self.session: Optional[aiohttp.ClientSession] = None
         self.ws_connections: Dict[str, websockets.WebSocketClientProtocol] = {}
         self.subscriptions: Dict[str, Callable] = {}
+        self.funding_callbacks: Dict[str, Callable] = {}  # 资金费率回调
         
         self.running = False
         self._reconnect_delay = 1
@@ -176,7 +177,72 @@ class BinanceConnector:
         await self._subscribe_stream(stream_name, callback)
         logger.info(f"Subscribed ticker: {symbol}")
     
-    async def _subscribe_stream(self, stream_name: str, callback: Callable):
+    async def subscribe_funding_rate(self, symbol: str, callback: Callable):
+        """
+        订阅资金费率 (通过轮询REST API)
+        
+        Args:
+            symbol: 交易对
+            callback: 回调函数
+        """
+        # 资金费率通过REST API轮询获取，WebSocket没有实时流
+        self.funding_callbacks[symbol] = callback
+        logger.info(f"Registered funding rate callback for: {symbol}")
+    
+    async def start_funding_polling(self, interval: int = 300):
+        """
+        启动资金费率轮询
+        
+        Args:
+            interval: 轮询间隔(秒)，默认300秒(5分钟)
+        """
+        import asyncio
+        from datetime import datetime
+        
+        logger.info(f"Starting funding rate polling (interval: {interval}s)")
+        
+        while True:
+            try:
+                for symbol in list(self.funding_callbacks.keys()):
+                    try:
+                        funding_data = await self.get_funding_rate(symbol)
+                        if funding_data:
+                            # 构造与WebSocket一致的回调格式
+                            callback_data = {
+                                "symbol": symbol,
+                                "fundingRate": funding_data.get("fundingRate", "0"),
+                                "fundingTime": funding_data.get("fundingTime", 0),
+                                "nextFundingTime": funding_data.get("nextFundingTime", 0),
+                                "markPrice": funding_data.get("markPrice", "0"),
+                                "indexPrice": funding_data.get("indexPrice", "0"),
+                                "estimatedSettlePrice": funding_data.get("estimatedSettlePrice", "0"),
+                                "interestRate": funding_data.get("interestRate", "0"),
+                                "time": funding_data.get("time", int(datetime.now().timestamp() * 1000))
+                            }
+                            
+                            # 调用回调
+                            stream_name = f"{symbol.lower()}@markPrice"
+                            await self.funding_callbacks[symbol](stream_name, callback_data)
+                            logger.debug(f"Polled funding rate for {symbol}: {funding_data.get('fundingRate')}")
+                    except Exception as e:
+                        logger.error(f"Error polling funding rate for {symbol}: {e}")
+                
+                await asyncio.sleep(interval)
+            except Exception as e:
+                logger.error(f"Funding polling loop error: {e}")
+                await asyncio.sleep(10)  # 出错后短暂等待
+    
+    async def get_funding_rate(self, symbol: str) -> Dict:
+        """
+        获取当前资金费率
+        
+        Args:
+            symbol: 交易对
+            
+        Returns:
+            资金费率数据
+        """
+        return await self._rest_get("/fapi/v1/premiumIndex", {"symbol": symbol})
         """订阅流"""
         self.subscriptions[stream_name] = callback
         

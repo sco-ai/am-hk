@@ -37,7 +37,7 @@ logger = setup_logging("agent1_harvester")
 class MarketHarvester:
     """
     Agent 1: 市场数据采集器
-    
+
     职责：
     - BTC数据接入（Binance WebSocket实时）
     - 港股数据接入（老虎证券 - 待实现）
@@ -45,12 +45,12 @@ class MarketHarvester:
     - 新闻数据采集（NewsAPI, Twitter, 财联社）
     - 数据校验和格式化
     """
-    
+
     def __init__(self):
         self.agent_name = "agent1_harvester"
         self.bus = MessageBus(self.agent_name)
         self.running = False
-        
+
         # 订阅的市场配置
         self.subscriptions = {
             MarketType.BTC: {
@@ -119,28 +119,29 @@ class MarketHarvester:
                 "fetch_interval": 300,  # 每5分钟获取一次新闻
             }
         }
-        
+
         # 连接器
         self.binance: BinanceConnector = None
         self.tiger: TigerConnector = None
         self.news: NewsConnector = None
-        
+
         logger.info(f"{self.agent_name} initialized")
-    
+
     async def start(self):
         """启动采集器"""
         self.running = True
         logger.info(f"{self.agent_name} started")
-        
+
         # 启动币安连接器
         await self._start_binance()
-        
-        # 启动老虎证券连接器(美股/港股)
+
+        # 启动老虎证券连接器
         await self._start_tiger()
-        
+        # self.tiger = None
+
         # 启动新闻采集器
         await self._start_news_collector()
-        
+
         # 发布状态
         self.bus.publish_status({
             "state": "running",
@@ -152,7 +153,7 @@ class MarketHarvester:
             },
         })
         self.bus.flush()
-        
+
         try:
             while self.running:
                 await asyncio.sleep(10)
@@ -162,101 +163,106 @@ class MarketHarvester:
             logger.info(f"{self.agent_name} cancelled")
         finally:
             await self.stop()
-    
+
     async def stop(self):
         """停止采集器"""
         logger.info(f"{self.agent_name} stopping...")
         self.running = False
-        
-        # 断开币安
+
+        # 断开币安 WebSocket
         if self.binance:
             await self.binance.disconnect()
-        
+
         # 断开老虎证券
         if self.tiger:
             await self.tiger.disconnect()
-        
+
         # 断开新闻
         if self.news:
             await self.news.disconnect()
-        
+
         # 发布状态
         self.bus.publish_status({"state": "stopped"})
         self.bus.flush()
         self.bus.close()
-        
+
         logger.info(f"{self.agent_name} stopped")
-    
+
     async def _start_binance(self):
         """启动币安连接"""
         logger.info("Starting Binance connector...")
-        
+
         self.binance = BinanceConnector(
             api_key=settings.BINANCE_API_KEY,
             api_secret=settings.BINANCE_SECRET,
             testnet=settings.BINANCE_TESTNET,
         )
-        
+
         await self.binance.connect()
-        
+
         # 订阅BTC数据
         btc_config = self.subscriptions[MarketType.BTC]
-        
+
         for symbol in btc_config["symbols"]:
             # 订阅K线
             for interval in btc_config["intervals"]:
                 await self.binance.subscribe_kline(
                     symbol, interval, self._on_binance_kline
                 )
-            
+
             # 订阅逐笔成交
             await self.binance.subscribe_trade(symbol, self._on_binance_trade)
-            
+
             # 订阅订单簿
             await self.binance.subscribe_orderbook(symbol, 5, self._on_binance_orderbook)
 
-            # 订阅资金数据（合约数据）
+            # 订阅资金费率
             await self.binance.subscribe_funding_rate(symbol, self._on_binance_funding_rate)
-            await self.binance.subscribe_open_interest(symbol, self._on_binance_open_interest)
-            await self.binance.subscribe_long_short_ratio(symbol, self._on_binance_long_short_ratio)
 
-            logger.info(f"Subscribed all streams for {symbol} (including funding data)")
+            # 订阅资金数据（通过REST API）
+            # Note: WebSocket 不支持资金数据，需要通过 REST 获取
+            logger.info(f"Subscribed WebSocket streams for {symbol}")
+
+        logger.info("Binance REST connector started successfully")
         
-        logger.info("Binance connector started successfully")
-        
-        # 启动REST轮询
+        # 启动数据轮询
         asyncio.create_task(self.binance.start_polling())
-
-        # 启动资金数据轮询（每5分钟一次）
+        
+        # 启动资金数据轮询
         asyncio.create_task(self.binance.start_funding_polling(interval=300))
 
-        logger.info("Binance funding data polling started (interval: 300s)")
-    
+        logger.info("Binance polling started (interval: 1s, funding: 300s)")
+
     async def _start_tiger(self):
         """启动老虎证券连接器(美股/港股)"""
-        logger.info("Starting Tiger connector...")
+        # 检查是否启用老虎API
+        if not getattr(settings, 'TIGER_ENABLED', True):
+            logger.warning("Tiger API is DISABLED. Skipping US/HK stock data collection.")
+            return
         
+        logger.info("Starting Tiger connector...")
+
         self.tiger = TigerConnector(
             account=settings.TIGER_ACCOUNT,
             private_key=settings.TIGER_PRIVATE_KEY,
         )
-        
+
         await self.tiger.connect()
-        
+
         # 启动美股数据采集
         us_config = self.subscriptions[MarketType.US_STOCK]
         if us_config["symbols"]:
             asyncio.create_task(self._us_collection_loop())
             logger.info(f"US stock collection started for: {us_config['symbols']}")
-        
+
         # 启动港股数据采集
         hk_config = self.subscriptions[MarketType.HK_STOCK]
         if hk_config["symbols"]:
             asyncio.create_task(self._hk_collection_loop())
             logger.info(f"HK stock collection started for: {hk_config['symbols']}")
-        
+
         logger.info("Tiger connector started successfully")
-    
+
     async def _us_collection_loop(self):
         """
         美股数据采集循环
@@ -266,9 +272,9 @@ class MarketHarvester:
         symbols = us_config["symbols"]
         intervals = us_config.get("intervals", ["1m", "5m", "1d"])
         poll_interval = us_config.get("poll_interval", 10)
-        
+
         logger.info(f"Starting US stock collection loop for {len(symbols)} symbols")
-        
+
         while self.running:
             try:
                 for symbol in symbols:
@@ -278,7 +284,7 @@ class MarketHarvester:
                             # 转换间隔格式
                             period_map = {"1m": "min1", "5m": "min5", "1d": "day"}
                             period = period_map.get(interval, "day")
-                            
+
                             klines = await self.tiger.get_klines(symbol, "US", period, limit=1)
                             if klines:
                                 for kline in klines:
@@ -287,7 +293,7 @@ class MarketHarvester:
                                     self._publish_us_data(symbol, standard_data)
                         except Exception as e:
                             logger.error(f"Error fetching kline for {symbol}: {e}")
-                    
+
                     # 2. 采集Level2订单簿
                     if us_config.get("enable_level2", True):
                         try:
@@ -296,7 +302,7 @@ class MarketHarvester:
                             self._publish_us_data(symbol, standard_data)
                         except Exception as e:
                             logger.error(f"Error fetching orderbook for {symbol}: {e}")
-                    
+
                     # 3. 采集盘前盘后数据
                     if us_config.get("enable_premarket", True):
                         try:
@@ -305,7 +311,7 @@ class MarketHarvester:
                             self._publish_us_data(symbol, standard_data)
                         except Exception as e:
                             logger.error(f"Error fetching premarket for {symbol}: {e}")
-                    
+
                     # 4. 采集暗池数据(仅限股票)
                     if us_config.get("enable_darkpool", True) and symbol not in ["QQQ", "SPY"]:
                         try:
@@ -314,7 +320,7 @@ class MarketHarvester:
                             self._publish_us_data(symbol, standard_data)
                         except Exception as e:
                             logger.error(f"Error fetching darkpool for {symbol}: {e}")
-                    
+
                     # 5. 采集ETF资金流(仅限ETF)
                     if us_config.get("enable_etf_flow", True) and symbol in ["QQQ", "SPY"]:
                         try:
@@ -323,7 +329,7 @@ class MarketHarvester:
                             self._publish_us_data(symbol, standard_data)
                         except Exception as e:
                             logger.error(f"Error fetching ETF flow for {symbol}: {e}")
-                    
+
                     # 6. 采集期权数据
                     if us_config.get("enable_options", True):
                         try:
@@ -332,18 +338,18 @@ class MarketHarvester:
                             self._publish_us_data(symbol, standard_data)
                         except Exception as e:
                             logger.error(f"Error fetching option data for {symbol}: {e}")
-                    
+
                     # 避免请求过快
                     await asyncio.sleep(0.5)
-                
+
                 logger.debug(f"US data collection cycle complete for {len(symbols)} symbols")
-                
+
             except Exception as e:
                 logger.error(f"US collection loop error: {e}", exc_info=True)
-            
+
             # 等待下一次采集
             await asyncio.sleep(poll_interval)
-    
+
     async def _hk_collection_loop(self):
         """
         港股数据采集循环
@@ -353,9 +359,9 @@ class MarketHarvester:
         symbols = hk_config["symbols"]
         intervals = hk_config.get("intervals", ["1m", "5m", "1d"])
         poll_interval = hk_config.get("poll_interval", 10)
-        
+
         logger.info(f"Starting HK stock collection loop for {len(symbols)} symbols")
-        
+
         while self.running:
             try:
                 for symbol in symbols:
@@ -364,7 +370,7 @@ class MarketHarvester:
                         try:
                             period_map = {"1m": "min1", "5m": "min5", "1d": "day"}
                             period = period_map.get(interval, "day")
-                            
+
                             klines = await self.tiger.get_klines(symbol, "HK", period, limit=1)
                             if klines:
                                 for kline in klines:
@@ -387,7 +393,7 @@ class MarketHarvester:
                                     self._publish_hk_data(symbol, standard_data)
                         except Exception as e:
                             logger.error(f"Error fetching HK kline for {symbol}: {e}")
-                    
+
                     # 2. 采集Level2盘口数据
                     if hk_config.get("enable_level2", True):
                         try:
@@ -406,7 +412,7 @@ class MarketHarvester:
                             self._publish_hk_data(symbol, standard_data)
                         except Exception as e:
                             logger.error(f"Error fetching HK orderbook for {symbol}: {e}")
-                    
+
                     # 3. 采集资金流数据(港股通-北水)
                     if hk_config.get("enable_capital_flow", True):
                         try:
@@ -428,7 +434,7 @@ class MarketHarvester:
                             self._publish_hk_data(symbol, standard_data)
                         except Exception as e:
                             logger.error(f"Error fetching HK capital flow for {symbol}: {e}")
-                    
+
                     # 4. 采集交易状态
                     try:
                         quote = await self.tiger.get_quote(symbol, "HK")
@@ -449,16 +455,28 @@ class MarketHarvester:
                         self._publish_hk_data(symbol, standard_data)
                     except Exception as e:
                         logger.error(f"Error fetching HK quote for {symbol}: {e}")
-                    
+
                     await asyncio.sleep(0.5)
-                
+
                 logger.debug(f"HK data collection cycle complete for {len(symbols)} symbols")
-                
+
             except Exception as e:
                 logger.error(f"HK collection loop error: {e}", exc_info=True)
-            
+
             await asyncio.sleep(poll_interval)
-    
+
+    def _publish_us_data(self, symbol: str, data: Dict):
+        """发布美股数据到Kafka"""
+        try:
+            self.bus.send(
+                topic="am-hk-raw-market-data",
+                key=symbol,
+                value=data
+            )
+            logger.debug(f"Published US {data['data_type']} data for {symbol}")
+        except Exception as e:
+            logger.error(f"Error publishing US data for {symbol}: {e}")
+
     def _publish_hk_data(self, symbol: str, data: Dict):
         """发布港股数据到Kafka"""
         try:
@@ -470,86 +488,79 @@ class MarketHarvester:
             logger.debug(f"Published HK {data['data_type']} data for {symbol}")
         except Exception as e:
             logger.error(f"Error publishing HK data for {symbol}: {e}")
-        """发布美股数据到Kafka"""
-        try:
-            self.bus.send(
-                topic="am-hk-raw-market-data",
-                key=symbol,
-                value=data
-            )
-            logger.debug(f"Published US {data['data_type']} data for {symbol}")
-        except Exception as e:
-            logger.error(f"Error publishing US data for {symbol}: {e}")
-    
+
     async def _start_news_collector(self):
         """启动新闻采集循环"""
         logger.info("Starting news collector...")
-        
+
         self.news = NewsConnector()
         await self.news.connect()
-        
+
         # 启动新闻采集任务
         news_config = self.subscriptions[MarketType.NEWS]
         fetch_interval = news_config.get("fetch_interval", 300)
-        
+
         asyncio.create_task(self._news_collection_loop(fetch_interval))
-        
+
         logger.info(f"News collector started (interval: {fetch_interval}s)")
-    
+
     async def _news_collection_loop(self, interval: int):
         """
         新闻采集循环
-        
+
         Args:
             interval: 采集间隔（秒）
         """
         while self.running:
             try:
                 logger.info("Fetching news data...")
-                
+
                 # 获取所有订阅标的的新闻
                 news_data = await self.news.fetch_all_news()
-                
+                logger.info(f"Fetched news data for {len(news_data)} symbols")
+
                 # 发布新闻到Kafka
                 for symbol, data in news_data.items():
+                    logger.info(f"Processing {symbol}: {len(data.get('articles', []))} articles, {len(data.get('cn_news', []))} cn_news")
+                    
                     # 发布文章
                     for article in data.get("articles", []):
                         await self._publish_news(article)
-                    
+
                     # 发布Twitter情绪
                     twitter_sentiment = data.get("twitter_sentiment", {})
                     if twitter_sentiment:
                         await self._publish_sentiment(twitter_sentiment)
-                    
+
                     # 发布中文新闻
                     for cn_news in data.get("cn_news", []):
                         await self._publish_news(cn_news)
-                
+
                 logger.info(f"News collection complete: {len(news_data)} symbols")
-                
+
             except Exception as e:
                 logger.error(f"News collection error: {e}", exc_info=True)
-            
+
             # 等待下一次采集
             await asyncio.sleep(interval)
-    
+
     async def _publish_news(self, news_item: Dict):
         """发布新闻到Kafka"""
         try:
             standard_data = convert_news_to_standard("news", news_item)
-            
+
             # 发布到新闻topic
             self.bus.send(
                 topic="am-hk-raw-market-data",
                 key=news_item.get("symbol", "NEWS"),
                 value=standard_data
             )
-            
-            logger.debug(f"Published news: {news_item.get('title', '')[:50]}...")
-        
+
+            logger.info(f"Published news: {news_item.get('title', '')[:50]}...")
+
         except Exception as e:
             logger.error(f"Error publishing news: {e}")
-    
+
     async def _publish_sentiment(self, sentiment_data: Dict):
         """发布情绪数据到Kafka"""
         try:
@@ -566,51 +577,51 @@ class MarketHarvester:
                     "source": sentiment_data.get("source", "unknown"),
                 }
             }
-            
+
             self.bus.send(
                 topic="am-hk-raw-market-data",
                 key=sentiment_data.get("symbol", "SENTIMENT"),
                 value=sentiment_msg
             )
-            
+
             logger.debug(f"Published sentiment for {sentiment_data.get('symbol')}: "
                         f"score={sentiment_data.get('sentiment_score', 0):.2f}")
-        
+
         except Exception as e:
             logger.error(f"Error publishing sentiment: {e}")
-    
+
     async def _on_binance_kline(self, stream: str, data: Dict):
         """币安K线回调"""
         try:
             # 提取symbol
             parts = stream.split("@")
             symbol = parts[0].upper()
-            
+
             # 转换为标准格式
             standard_data = convert_binance_kline(symbol, data)
-            
+
             # 发布到Kafka
             self.bus.publish_market_data(symbol, standard_data)
-            
+
             # 检查K线是否闭合
             if standard_data["payload"].get("is_closed"):
                 logger.debug(f"Kline closed: {symbol} {standard_data['payload']['interval']}")
-        
+
         except Exception as e:
             logger.error(f"Error processing kline: {e}", exc_info=True)
-    
+
     async def _on_binance_trade(self, stream: str, data: Dict):
         """币安成交回调"""
         try:
             parts = stream.split("@")
             symbol = parts[0].upper()
-            
+
             standard_data = convert_binance_trade(symbol, data)
             self.bus.publish_market_data(symbol, standard_data)
-        
+
         except Exception as e:
             logger.error(f"Error processing trade: {e}", exc_info=True)
-    
+
     async def _on_binance_orderbook(self, stream: str, data: Dict):
         """币安订单簿回调"""
         try:
@@ -631,7 +642,7 @@ class MarketHarvester:
 
             standard_data = convert_funding_rate_to_standard(symbol, data)
             self.bus.publish_market_data(symbol, standard_data)
-            logger.debug(f"Published funding rate for {symbol}: {standard_data['payload']['funding_rate']}")
+            logger.info(f"Published funding rate for {symbol}: {standard_data['payload']['funding_rate']}")
 
         except Exception as e:
             logger.error(f"Error processing funding rate: {e}", exc_info=True)
@@ -669,18 +680,18 @@ class MarketHarvester:
                 is_healthy = await self.binance.health_check()
                 if not is_healthy:
                     logger.warning("Binance health check failed")
-            
+
             # 检查老虎证券连接
             if self.tiger:
                 is_healthy = await self.tiger.health_check()
                 if not is_healthy:
                     logger.warning("Tiger health check failed")
-            
+
             if self.news:
                 # 新闻连接器没有健康检查，只检查是否运行
                 if not self.running:
                     logger.warning("News collector not running")
-        
+
         except Exception as e:
             logger.error(f"Health check error: {e}")
 

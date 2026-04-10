@@ -143,6 +143,9 @@ class BinanceRESTConnector:
                 # 轮询K线数据
                 await self._poll_klines()
                 
+                # 轮询成交数据
+                await self._poll_trades()
+                
                 # 轮询订单簿
                 await self._poll_orderbooks()
                 
@@ -278,6 +281,44 @@ class BinanceRESTConnector:
                     
             except Exception as e:
                 logger.error(f"Error polling ticker {symbol}: {e}")
+    
+    async def _poll_trades(self):
+        """轮询成交数据"""
+        for symbol, config in self.subscriptions["trade"].items():
+            try:
+                last_id = config.get("last_id", 0)
+                
+                # 获取最近成交
+                data = await self._get("/api/v3/trades", {
+                    "symbol": symbol,
+                    "limit": 20
+                })
+                
+                if data and len(data) > 0:
+                    callback = self.callbacks["trade"][symbol]
+                    
+                    for trade in data:
+                        trade_id = trade.get("id", 0)
+                        # 只处理新的成交
+                        if trade_id > last_id:
+                            trade_data = {
+                                "e": "trade",
+                                "E": trade.get("time", int(datetime.now().timestamp() * 1000)),
+                                "s": symbol,
+                                "t": trade_id,
+                                "p": trade.get("price"),
+                                "q": trade.get("qty"),
+                                "m": trade.get("isBuyerMaker", False),
+                            }
+                            await callback(f"{symbol.lower()}@trade", trade_data)
+                    
+                    # 更新最后ID
+                    self.subscriptions["trade"][symbol]["last_id"] = max(
+                        t.get("id", 0) for t in data
+                    )
+                    
+            except Exception as e:
+                logger.error(f"Error polling trades {symbol}: {e}")
     
     async def _poll_funding_rates(self):
         """轮询资金费率"""

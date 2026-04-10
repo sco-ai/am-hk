@@ -44,7 +44,8 @@ class TigerConnector:
         self.account = account or settings.TIGER_ACCOUNT
         self.private_key = private_key or settings.TIGER_PRIVATE_KEY
         self.paper_trading = settings.TIGER_ENABLE_PAPER
-        self.proxy = proxy or os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+        # 优先使用传入的proxy参数，其次从settings读取，最后从环境变量读取
+        self.proxy = proxy or settings.HTTP_PROXY or settings.HTTPS_PROXY or os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
         
         # 选择端点
         if self.paper_trading:
@@ -56,12 +57,15 @@ class TigerConnector:
             self.ws_url = self.WS_URL_LIVE
             logger.warning("Tiger connector initialized [LIVE TRADING] - USE WITH CAUTION")
         
-        # 配置HTTP客户端使用代理
+        # 配置HTTP客户端使用代理 (httpx 0.28+ 使用 mounts)
         if self.proxy:
             self.http_client: Optional[httpx.AsyncClient] = httpx.AsyncClient(
                 base_url=self.base_url,
                 timeout=30.0,
-                proxies=self.proxy,
+                mounts={
+                    "https://": httpx.AsyncHTTPTransport(proxy=self.proxy),
+                    "http://": httpx.AsyncHTTPTransport(proxy=self.proxy),
+                }
             )
             logger.info(f"Using proxy: {self.proxy}")
         else:

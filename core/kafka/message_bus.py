@@ -72,22 +72,33 @@ class MessageBus:
         logger.warning(f"[{client_id}] 使用内存模式 (无持久化)")
     
     def send(self, topic: str, key: str, value: Dict):
-        """发送消息 (Redis原生)"""
+        """发送消息 - 根据后端选择 Kafka 或 Redis"""
         try:
             import json
-            import redis
             
-            # 直接使用Redis发布
-            r = redis.from_url(settings.redis_url)
             message = {
                 "key": key,
                 "value": value,
                 "topic": topic,
                 "timestamp": datetime.now().isoformat()
             }
-            r.publish(topic, json.dumps(message))
-            logger.debug(f"Published to {topic}: {key}")
             
+            if self.backend == "kafka" and self.producer:
+                # Kafka 模式
+                self.producer.produce(
+                    topic,
+                    key=key.encode('utf-8'),
+                    value=json.dumps(message).encode('utf-8')
+                )
+                self.producer.poll(0)  # 非阻塞处理回调
+                logger.debug(f"Published to Kafka {topic}: {key}")
+            else:
+                # Redis 降级模式
+                import redis
+                r = redis.from_url(settings.redis_url)
+                r.publish(topic, json.dumps(message))
+                logger.debug(f"Published to Redis {topic}: {key}")
+                
         except Exception as e:
             logger.error(f"发送消息失败: {e}")
     

@@ -43,7 +43,7 @@ class NewsConnector:
         if proxy:
             self.client = httpx.AsyncClient(
                 timeout=30.0,
-                proxies=proxy,
+                proxy=proxy,
             )
             logger.info(f"News connector using proxy: {proxy}")
         else:
@@ -89,7 +89,7 @@ class NewsConnector:
             新闻列表
         """
         if not self.newsapi_key:
-            logger.warning("NewsAPI key not configured")
+            logger.debug("NewsAPI key not configured, skipping")
             return []
         
         url = "https://newsapi.org/v2/top-headlines"

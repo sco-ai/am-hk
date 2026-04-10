@@ -554,3 +554,16 @@ class AlphaScanner:
     def health_check(self) -> bool:
         """检查Ollama服务状态"""
         return self.ollama.health_check()
+
+    # ==================== 生命周期方法 ====================
+    
+    async def start(self):
+        """启动 AlphaScanner"""
+        self.logger.info("AlphaScanner started")
+        # Scanner runs on-demand via message consumption
+        while True:
+            await asyncio.sleep(60)  # Keep alive
+    
+    async def stop(self):
+        """停止 AlphaScanner"""
+        self.logger.info("AlphaScanner stopped")

@@ -118,12 +118,20 @@ class AgentConsumer(BaseConsumer):
     
     def process_message(self, msg_key: str, msg_value: Dict, headers: Optional[Dict]):
         """路由消息到对应处理器"""
-        msg_type = msg_value.get("msg_type", "unknown")
-        
+        # 支持 msg_type 或 data_type 字段
+        msg_type = msg_value.get("msg_type") or msg_value.get("data_type", "unknown")
+
         if msg_type in self.handlers:
             try:
                 self.handlers[msg_type](msg_key, msg_value, headers)
             except Exception as e:
                 logger.error(f"Handler error for {msg_type}: {e}", exc_info=True)
         else:
-            logger.warning(f"No handler for message type: {msg_type}")
+            # 尝试使用默认的 market_data handler
+            if "market_data" in self.handlers:
+                try:
+                    self.handlers["market_data"](msg_key, msg_value, headers)
+                except Exception as e:
+                    logger.error(f"Handler error for market_data: {e}", exc_info=True)
+            else:
+                logger.debug(f"No handler for message type: {msg_type}")

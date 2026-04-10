@@ -183,6 +183,140 @@ class DataCleaner:
         self.last_prices: Dict[str, float] = {}
         self.price_history: Dict[str, deque] = {}
 
+    def clean_kline_data(self, symbol: str, data: Dict) -> Tuple[Optional[Dict], DataQualityMetrics]:
+        """清洗K线数据"""
+        # K线数据复用Tick数据清洗逻辑，但添加OHLC字段
+        start_time = time.time()
+        
+        # 使用close价格作为主要价格
+        price = data.get("close")
+        if price is None:
+            price = self._extract_price(data)
+        
+        timestamp = self._extract_timestamp(data)
+        volume = data.get("volume", 0)
+        
+        missing_count = 0
+        if price is None:
+            missing_count += 1
+            price = self._forward_fill_price(symbol)
+        
+        if timestamp is None:
+            missing_count += 1
+            timestamp = generate_timestamp()
+        
+        outlier_count = 0
+        is_outlier = False
+        zscore = 0.0
+        
+        if price is not None:
+            zscore = self._calculate_zscore(symbol, price)
+            if abs(zscore) > self.zscore_threshold:
+                outlier_count += 1
+                is_outlier = True
+                price = self._forward_fill_price(symbol) or price
+        
+        if isinstance(timestamp, datetime):
+            timestamp = timestamp.replace(microsecond=(timestamp.microsecond // 1000) * 1000)
+        
+        latency_ms = (time.time() - start_time) * 1000
+        if isinstance(timestamp, datetime):
+            data_age_ms = (generate_timestamp() - timestamp).total_seconds() * 1000
+            latency_ms = max(latency_ms, data_age_ms)
+        
+        expected_fields = ["open", "high", "low", "close", "volume"]
+        present_fields = sum(1 for f in expected_fields if data.get(f) is not None)
+        completeness_pct = (present_fields / len(expected_fields)) * 100
+        
+        quality_score = self._calculate_quality_score(latency_ms, completeness_pct, outlier_count)
+        quality_level = self._determine_quality_level(latency_ms, completeness_pct, outlier_count)
+        
+        quality_metrics = DataQualityMetrics(
+            symbol=symbol, timestamp=generate_timestamp(), latency_ms=latency_ms,
+            completeness_pct=completeness_pct, outlier_count=outlier_count,
+            missing_count=missing_count, quality_level=quality_level, quality_score=quality_score
+        )
+        
+        if quality_level == DataQualityLevel.UNRELIABLE:
+            return None, quality_metrics
+        
+        cleaned_data = {
+            "symbol": symbol,
+            "price": price,
+            "open": data.get("open"),
+            "high": data.get("high"),
+            "low": data.get("low"),
+            "close": data.get("close"),
+            "volume": volume,
+            "interval": data.get("interval"),
+            "timestamp": timestamp.isoformat() if isinstance(timestamp, datetime) else timestamp,
+            "zscore": zscore,
+            "is_outlier": is_outlier,
+        }
+        
+        if price is not None:
+            self.last_prices[symbol] = price
+            if symbol not in self.price_history:
+                self.price_history[symbol] = deque(maxlen=1000)
+            self.price_history[symbol].append({"timestamp": timestamp, "price": price, "volume": volume})
+        
+        return cleaned_data, quality_metrics
+
+    def clean_orderbook_data(self, symbol: str, data: Dict) -> Tuple[Optional[Dict], DataQualityMetrics]:
+        """清洗订单簿数据"""
+        start_time = time.time()
+        
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        timestamp = self._extract_timestamp(data)
+        
+        missing_count = 0
+        if not bids or not asks:
+            missing_count += 1
+        
+        if timestamp is None:
+            missing_count += 1
+            timestamp = generate_timestamp()
+        
+        # 计算买卖盘质量
+        total_bid_volume = sum(b[1] for b in bids[:5]) if bids else 0
+        total_ask_volume = sum(a[1] for a in asks[:5]) if asks else 0
+        spread = (asks[0][0] - bids[0][0]) if bids and asks else 0
+        
+        outlier_count = 0
+        if spread > 0 and bids:
+            mid_price = (bids[0][0] + asks[0][0]) / 2
+            spread_pct = spread / mid_price
+            if spread_pct > 0.05:  # 5% spread is suspicious
+                outlier_count += 1
+        
+        latency_ms = (time.time() - start_time) * 1000
+        completeness_pct = 100 - (missing_count * 20)
+        
+        quality_score = self._calculate_quality_score(latency_ms, completeness_pct, outlier_count)
+        quality_level = self._determine_quality_level(latency_ms, completeness_pct, outlier_count)
+        
+        quality_metrics = DataQualityMetrics(
+            symbol=symbol, timestamp=generate_timestamp(), latency_ms=latency_ms,
+            completeness_pct=completeness_pct, outlier_count=outlier_count,
+            missing_count=missing_count, quality_level=quality_level, quality_score=quality_score
+        )
+        
+        if quality_level == DataQualityLevel.UNRELIABLE:
+            return None, quality_metrics
+        
+        cleaned_data = {
+            "symbol": symbol,
+            "bids": bids[:10],  # 只保留前10档
+            "asks": asks[:10],
+            "timestamp": timestamp.isoformat() if isinstance(timestamp, datetime) else timestamp,
+            "spread": spread,
+            "total_bid_volume": total_bid_volume,
+            "total_ask_volume": total_ask_volume,
+        }
+        
+        return cleaned_data, quality_metrics
+
     def clean_tick_data(self, symbol: str, data: Dict) -> Tuple[Optional[Dict], DataQualityMetrics]:
         """清洗Tick数据"""
         start_time = time.time()
