@@ -796,13 +796,31 @@ class DataCurator:
             "data_quality_control": True,
         })
         
+        # 在后台线程运行消费者，避免阻塞事件循环
+        import threading
+        consumer_thread = threading.Thread(target=self._run_consumer_sync, name="Agent2Consumer")
+        consumer_thread.daemon = True
+        consumer_thread.start()
+        logger.info(f"Consumer started in background thread: {consumer_thread.name}")
+        
+        # 保持主循环运行
         try:
-            self.consumer.start()
+            while self.running:
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            logger.info("Main loop cancelled")
         except Exception as e:
-            logger.error(f"Consumer error: {e}", exc_info=True)
+            logger.error(f"Main loop error: {e}", exc_info=True)
         finally:
             await self.stop()
 
+    def _run_consumer_sync(self):
+        """在后台线程中同步运行消费者"""
+        try:
+            self.consumer.start()
+        except Exception as e:
+            logger.error(f"Consumer thread error: {e}", exc_info=True)
+    
     async def stop(self):
         """停止Agent2"""
         logger.info(f"{self.agent_name} stopping...")

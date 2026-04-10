@@ -114,7 +114,15 @@ class LearningFeedback:
         ]
         
         try:
-            self.consumer.start()
+            # 在后台线程运行消费者
+            import threading
+            consumer_thread = threading.Thread(target=self.consumer.start)
+            consumer_thread.daemon = True
+            consumer_thread.start()
+            logger.info(f"DEBUG: Consumer started in background thread")
+            
+            # 等待所有任务完成
+            await asyncio.gather(*tasks)
         except Exception as e:
             logger.error(f"Consumer error: {e}", exc_info=True)
         finally:

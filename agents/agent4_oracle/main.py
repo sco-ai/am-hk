@@ -105,6 +105,7 @@ class TradingDecision:
     track_a_score: float
     track_b_score: float
     sentiment_score: float
+    risk_score: float = 0.5  # 添加风险评分字段
     
     def to_dict(self) -> Dict:
         return {
@@ -118,6 +119,7 @@ class TradingDecision:
             "track_a_score": round(self.track_a_score, 4),
             "track_b_score": round(self.track_b_score, 4),
             "sentiment_score": round(self.sentiment_score, 4),
+            "risk_score": round(self.risk_score, 4),  # 添加到输出
         }
 
 
@@ -628,8 +630,10 @@ class TrendOracle:
         """启动决策层"""
         self.running = True
         logger.info(f"{self.agent_name} started")
+        logger.info(f"DEBUG: Registering handler for opportunity messages")
         
         self.consumer.register_handler("opportunity", self._on_opportunity)
+        logger.info(f"DEBUG: Handler registered. Topics: {self.consumer.topics}")
         
         self.bus.publish_status({
             "state": "running",
@@ -645,7 +649,18 @@ class TrendOracle:
         })
         
         try:
-            self.consumer.start()
+            logger.info(f"DEBUG: Starting consumer...")
+            # 在后台线程运行消费者
+            import threading
+            consumer_thread = threading.Thread(target=self.consumer.start)
+            consumer_thread.daemon = True
+            consumer_thread.start()
+            logger.info(f"DEBUG: Consumer started in background thread")
+            
+            # 保持主循环运行
+            while self.running:
+                await asyncio.sleep(1)
+                
         except Exception as e:
             logger.error(f"Consumer error: {e}", exc_info=True)
         finally:
@@ -667,8 +682,24 @@ class TrendOracle:
         logger.info(f"{self.agent_name} stopped")
     
     def _on_opportunity(self, key: str, value: Dict, headers: Optional[Dict]):
-        """处理交易机会"""
-        asyncio.create_task(self._process_opportunity_async(key, value, headers))
+        """处理交易机会 - 在后台线程中运行异步处理"""
+        logger.info(f"DEBUG: Received opportunity message for key={key}")
+        
+        # 在后台线程中创建新的事件循环来运行异步任务
+        def run_async_in_thread():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(self._process_opportunity_async(key, value, headers))
+                loop.close()
+            except Exception as e:
+                logger.error(f"DEBUG: Error in thread processing: {e}", exc_info=True)
+        
+        import threading
+        thread = threading.Thread(target=run_async_in_thread)
+        thread.daemon = True
+        thread.start()
+        logger.info(f"DEBUG: Started processing thread for {key}")
     
     async def _process_opportunity_async(self, key: str, value: Dict, headers: Optional[Dict]):
         """异步处理交易机会"""
@@ -838,12 +869,35 @@ class TrendOracle:
             track_a_score=track_a.confidence,
             track_b_score=track_b.confidence,
             sentiment_score=sentiment.score,
+            risk_score=0.5,  # 添加风险评分
         )
     
     def _publish_decision(self, decision: TradingDecision, symbol: str, 
                           track_a: TrackAPrediction, track_b: TrackBAnalysis, 
                           sentiment: SentimentAnalysis):
-        """发布交易决策到Kafka"""
+        """发布交易决策到Kafka - 兼容 core.models.TradeDecision 格式"""
+        
+        # 构建符合 core.models.Signal 格式的 signal (注意：action小写，添加所有必需字段)
+        decision_dict = {
+            "signal": {
+                "symbol": symbol,
+                "market": "CRYPTO",  # 添加市场类型
+                "action": decision.action.value.lower(),  # 转为小写: hold/buy/sell/pass
+                "confidence": decision.confidence,
+                "predicted_return": track_a.predicted_return,  # 添加预测收益
+                "timeframe": "5min",  # 添加时间框架
+                "reasoning": decision.reasoning,  # 添加推理
+                "agent_id": "agent4_oracle",  # 添加agent_id
+                "timestamp": generate_timestamp().isoformat(),
+            },
+            "position_size": decision.position_size,
+            "stop_loss": decision.sl,
+            "take_profit": decision.tp,
+            "risk_score": decision.risk_score,
+            "approved": False,
+            "approval_reason": "",
+        }
+        
         message = {
             "msg_id": generate_msg_id(),
             "msg_type": "trading_decision",
@@ -853,10 +907,12 @@ class TrendOracle:
             "priority": 2,
             "payload": {
                 "symbol": symbol,
-                "decision": decision.to_dict(),
-                "track_a": track_a.to_dict(),
-                "track_b": track_b.to_dict(),
-                "sentiment": sentiment.to_dict(),
+                "decision": decision_dict,
+                "factors": {
+                    "track_a_confidence": track_a.confidence,
+                    "track_b_confidence": track_b.confidence,
+                    "sentiment_score": sentiment.score,
+                },
             },
         }
         

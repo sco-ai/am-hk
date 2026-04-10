@@ -1,5 +1,5 @@
 """
-应用配置管理
+应用配置管理 - Enhanced v2.03
 """
 import os
 from typing import Dict, List, Optional
@@ -45,91 +45,159 @@ class Settings(BaseSettings):
     ZOOKEEPER_PORT: int = 2201
     KAFKA_UI_PORT: int = 8100
 
-    # === AI 模型配置 ===
+    # ============================================
+    # 模型配置 (v2.03)
+    # ============================================
+    LIGHTGBM_MODEL_PATH: str = "./models/lightgbm_model.pkl"
+    XGBOOST_MODEL_PATH: str = "./models/xgboost_model.pkl"
+    RL_MODEL_PATH: str = "./models/ppo_position_model.pkl"
+    
+    MODEL_UPDATE_INTERVAL: int = 3600
+    MODEL_CACHE_TTL: int = 300
+    MODEL_PREDICTION_THRESHOLD: float = 0.65
+    
+    # 模型融合权重
+    ENSEMBLE_LGB_WEIGHT: float = 0.45
+    ENSEMBLE_XGB_WEIGHT: float = 0.35
+    ENSEMBLE_RL_WEIGHT: float = 0.20
 
-    # OpenAI GPT-4.1
+    # ============================================
+    # 风控配置 (v2.03)
+    # ============================================
+    # 仓位限制
+    MAX_POSITION_PCT: float = 0.30
+    MAX_SINGLE_POSITION_PCT: float = 0.15
+    MAX_TOTAL_EXPOSURE_PCT: float = 1.0
+    
+    # 风险阈值
+    MAX_DAILY_LOSS_PCT: float = 0.05
+    MAX_DRAWDOWN_PCT: float = 0.15
+    MAX_RISK_PER_TRADE_PCT: float = 0.02
+    ACCOUNT_RISK_LIMIT_PCT: float = 0.06
+    VAR_LIMIT_PCT: float = 0.03
+    
+    # 止损设置
+    DEFAULT_STOP_LOSS_PCT: float = 0.02
+    TRAILING_STOP_ACTIVATION_PCT: float = 0.01
+    TRAILING_STOP_DISTANCE_PCT: float = 0.015
+    MAX_HOLDING_HOURS: int = 48
+
+    # ============================================
+    # 市场状态配置 (v2.03)
+    # ============================================
+    TREND_DETECTION_PERIOD: int = 20
+    MARKET_STATE_WINDOW: int = 100
+    
+    # 波动率阈值
+    VOL_VERY_LOW_THRESHOLD: float = 5.0
+    VOL_LOW_THRESHOLD: float = 15.0
+    VOL_NORMAL_THRESHOLD: float = 35.0
+    VOL_HIGH_THRESHOLD: float = 60.0
+    
+    # 自适应权重
+    ADAPTIVE_WEIGHT_UPDATE_INTERVAL: int = 3600
+    WEIGHT_ADJUSTMENT_SPEED: float = 0.1
+
+    # ============================================
+    # 加密货币专属配置 (v2.03)
+    # ============================================
+    CRYPTO_PAIRS: List[str] = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"]
+    
+    FUNDING_RATE_THRESHOLD: float = 0.001
+    FUNDING_RATE_EXTREME: float = 0.003
+    
+    OI_CHANGE_ALERT_THRESHOLD: float = 10.0
+    OI_MONITORING_WINDOW: int = 24
+    
+    LIQUIDATION_ALERT_THRESHOLD: float = 0.7
+    CASCADE_RISK_THRESHOLD: float = 0.8
+
+    # ============================================
+    # AI 模型配置
+    # ============================================
     OPENAI_API_KEY: str = ""
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"
 
-    # DeepSeek
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
 
-    # Qwen2.5 (Track B主模型)
     QWEN_API_KEY: str = ""
-    QWEN_API_URL: str = "https://api.openai.com/v1"  # 兼容OpenAI格式
+    QWEN_API_URL: str = "https://api.openai.com/v1"
 
-    # Kimi (Track B备选模型)
     KIMI_API_KEY: str = ""
     KIMI_API_URL: str = "https://api.moonshot.cn/v1"
 
-    # Informer时序预测
     INFORMER_API_URL: str = ""
     INFORMER_API_KEY: str = ""
 
-    # N-HiTS时序模型
     NHITS_API_URL: str = ""
     NHITS_API_KEY: str = ""
 
-    # 强化学习模型
     RL_API_URL: str = ""
     RL_API_KEY: str = ""
 
-    # GNN图神经网络
     GNN_API_URL: str = ""
     GNN_API_KEY: str = ""
 
-    # FinBERT情绪分析
     FINBERT_API_URL: str = ""
     FINBERT_API_KEY: str = ""
 
-    # === 新闻 API 配置 ===
+    # ============================================
+    # 新闻 API 配置
+    # ============================================
     NEWSAPI_KEY: str = "ca67cb343dd04a2581cded62f2964fd4"
     TWITTER_BEARER_TOKEN: str = ""
     REDDIT_CLIENT_ID: str = ""
     REDDIT_SECRET: str = ""
 
-    # === 交易 API 配置 ===
+    # ============================================
+    # 交易 API 配置
+    # ============================================
     BINANCE_API_KEY: str = ""
     BINANCE_SECRET: str = ""
-    BINANCE_TESTNET: bool = False  # 默认主网
+    BINANCE_TESTNET: bool = False
 
-    # Tiger Securities - DISABLED by default (risk of API ban)
-    TIGER_ENABLED: bool = False  # Set to true to enable HK/US stock data
+    ALPHAVANTAGE_API_KEY: str = ""
+    ALPHAVANTAGE_ENABLED: bool = False
+
+    # Tiger Securities - DISABLED
+    TIGER_ENABLED: bool = False
     TIGER_ID: str = ""
     TIGER_ACCOUNT: str = ""
     TIGER_LICENSE: str = ""
     TIGER_ENV: str = "PROD"
     TIGER_PRIVATE_KEY: str = ""
-    TIGER_ENABLE_PAPER: bool = True  # true=模拟盘, false=实盘
+    TIGER_ENABLE_PAPER: bool = True
 
+    # ============================================
     # 数据采集配置
-    DATA_COLLECTION_INTERVAL: int = 60  # 秒
-    MARKETS: List[str] = ["btc", "hk_stock", "us_stock"]
+    # ============================================
+    DATA_COLLECTION_INTERVAL: int = 60
+    MARKETS: List[str] = ["crypto"]  # 禁用美股和港股
 
-    # 风控配置
-    MAX_POSITION_SIZE: float = 0.1  # 最大仓位10%
-    MAX_DAILY_LOSS: float = 0.05    # 最大日亏损5%
-    STOP_LOSS_PCT: float = 0.02     # 止损2%
-    TAKE_PROFIT_PCT: float = 0.05   # 止盈5%
+    # ============================================
+    # 旧风控配置 (兼容)
+    # ============================================
+    MAX_POSITION_SIZE: float = 0.1
+    MAX_DAILY_LOSS: float = 0.05
+    STOP_LOSS_PCT: float = 0.02
+    TAKE_PROFIT_PCT: float = 0.05
 
-    # 模型配置
-    MODEL_UPDATE_INTERVAL: int = 3600  # 模型更新间隔（秒）
+    # ============================================
+    # 其他配置
+    # ============================================
+    MODEL_UPDATE_INTERVAL_LEGACY: int = 3600
     PREDICTION_TIMEFRAMES: List[str] = ["5min", "15min", "1h"]
 
-    # 飞书配置
     FEISHU_APP_ID: str = ""
     FEISHU_APP_SECRET: str = ""
     FEISHU_WEBHOOK_URL: str = ""
 
-    # 代理配置
     HTTP_PROXY: str = "http://127.0.0.1:2080"
     HTTPS_PROXY: str = ""
 
-    # 应用安全配置
     SECRET_KEY: str = "generate_a_strong_secret_key_here"
 
-    # 日志配置
     LOG_LEVEL: str = "INFO"
     LOG_FORMAT: str = "json"
 
@@ -144,6 +212,39 @@ class Settings(BaseSettings):
         if self.REDIS_PASSWORD:
             return f"redis://:{self.REDIS_PASSWORD}@{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
         return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/{self.REDIS_DB}"
+    
+    @property
+    def model_weights(self) -> Dict[str, float]:
+        """获取模型融合权重"""
+        return {
+            "lightgbm": self.ENSEMBLE_LGB_WEIGHT,
+            "xgboost": self.ENSEMBLE_XGB_WEIGHT,
+            "rl": self.ENSEMBLE_RL_WEIGHT,
+        }
+    
+    @property
+    def risk_limits(self) -> Dict[str, float]:
+        """获取风险限制"""
+        return {
+            "max_position_pct": self.MAX_POSITION_PCT,
+            "max_single_position_pct": self.MAX_SINGLE_POSITION_PCT,
+            "max_total_exposure_pct": self.MAX_TOTAL_EXPOSURE_PCT,
+            "max_daily_loss_pct": self.MAX_DAILY_LOSS_PCT,
+            "max_drawdown_pct": self.MAX_DRAWDOWN_PCT,
+            "max_risk_per_trade_pct": self.MAX_RISK_PER_TRADE_PCT,
+            "account_risk_limit_pct": self.ACCOUNT_RISK_LIMIT_PCT,
+            "var_limit_pct": self.VAR_LIMIT_PCT,
+        }
+    
+    @property
+    def stop_loss_config(self) -> Dict[str, any]:
+        """获取止损配置"""
+        return {
+            "default_stop_pct": self.DEFAULT_STOP_LOSS_PCT,
+            "trailing_activation_pct": self.TRAILING_STOP_ACTIVATION_PCT,
+            "trailing_distance_pct": self.TRAILING_STOP_DISTANCE_PCT,
+            "max_holding_hours": self.MAX_HOLDING_HOURS,
+        }
 
     def ai_model_enabled(self, model_name: str) -> bool:
         """检查AI模型是否已配置"""
