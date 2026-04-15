@@ -117,9 +117,14 @@ class AgentConsumer(BaseConsumer):
         logger.info(f"Registered handler for {msg_type}")
     
     def process_message(self, msg_key: str, msg_value: Dict, headers: Optional[Dict]):
-        """路由消息到对应处理器"""
+        """路由消息到对应处理器 - 支持两种消息格式"""
+        # 处理可能的包装格式 (来自 message_bus.py)
+        actual_value = msg_value
+        if "value" in msg_value and "topic" in msg_value and "timestamp" in msg_value:
+            actual_value = msg_value.get("value", msg_value)
+        
         # 支持 msg_type 或 data_type 字段
-        msg_type = msg_value.get("msg_type") or msg_value.get("data_type", "unknown")
+        msg_type = actual_value.get("msg_type") or actual_value.get("data_type", "unknown")
 
         if msg_type in self.handlers:
             try:
