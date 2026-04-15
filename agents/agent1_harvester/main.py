@@ -1,6 +1,6 @@
 """
 Agent 1: MarketHarvester
-多市场数据采集器 - 币安实时数据 + 老虎证券(港股/美股) + 新闻采集
+多市场数据采集器 - 币安实时数据 + Alpha Vantage(美股) + 新闻采集
 """
 import asyncio
 import logging
@@ -15,6 +15,7 @@ from core.connectors.binance_rest import (
     convert_open_interest_to_standard,
     convert_long_short_ratio_to_standard,
 )
+from core.connectors.alpha_vantage import AlphaVantageConnector
 from core.connectors.tiger import (
     TigerConnector,
     convert_us_kline_to_standard,
@@ -123,6 +124,7 @@ class MarketHarvester:
         # 连接器
         self.binance: BinanceConnector = None
         self.tiger: TigerConnector = None
+        self.alpha_vantage: AlphaVantageConnector = None
         self.news: NewsConnector = None
 
         logger.info(f"{self.agent_name} initialized")
@@ -137,7 +139,9 @@ class MarketHarvester:
 
         # 启动老虎证券连接器
         await self._start_tiger()
-        # self.tiger = None
+        
+        # 启动 Alpha Vantage 连接器（老虎禁用时的替代方案）
+        await self._start_alpha_vantage()
 
         # 启动新闻采集器
         await self._start_news_collector()
@@ -176,6 +180,10 @@ class MarketHarvester:
         # 断开老虎证券
         if self.tiger:
             await self.tiger.disconnect()
+        
+        # 断开 Alpha Vantage
+        if self.alpha_vantage:
+            await self.alpha_vantage.disconnect()
 
         # 断开新闻
         if self.news:
@@ -262,6 +270,56 @@ class MarketHarvester:
             logger.info(f"HK stock collection started for: {hk_config['symbols']}")
 
         logger.info("Tiger connector started successfully")
+
+    async def _start_alpha_vantage(self):
+        """启动 Alpha Vantage 连接器(美股替代方案)"""
+        if not getattr(settings, 'ALPHAVANTAGE_ENABLED', False):
+            logger.warning("Alpha Vantage is DISABLED. Skipping US stock data collection.")
+            return
+        
+        if not settings.ALPHAVANTAGE_API_KEY:
+            logger.error("Alpha Vantage API Key not configured!")
+            return
+        
+        logger.info("Starting Alpha Vantage connector...")
+        
+        self.alpha_vantage = AlphaVantageConnector(
+            api_key=settings.ALPHAVANTAGE_API_KEY
+        )
+        
+        await self.alpha_vantage.connect()
+        
+        # 启动美股数据采集
+        us_config = self.subscriptions[MarketType.US_STOCK]
+        if us_config["symbols"]:
+            asyncio.create_task(
+                self.alpha_vantage.start_polling(
+                    symbols=us_config["symbols"],
+                    callback=self._on_alpha_vantage_data,
+                    intervals=["5min"]  # 免费版限制，只取5分钟线
+                )
+            )
+            logger.info(f"Alpha Vantage US stock collection started for: {us_config['symbols']}")
+        
+        logger.info("Alpha Vantage connector started successfully")
+    
+    async def _on_alpha_vantage_data(self, symbol: str, data: Dict):
+        """Alpha Vantage 数据回调"""
+        try:
+            # 发布到 Kafka
+            self.bus.publish(MarketData(
+                symbol=symbol,
+                market="US",
+                timestamp=data.get("timestamp", generate_timestamp()),
+                data_type=DataType(data.get("data_type", "kline")),
+                payload=data.get("payload", {}),
+                msg_id=generate_msg_id(),
+            ))
+            
+            logger.debug(f"Published Alpha Vantage data for {symbol}")
+            
+        except Exception as e:
+            logger.error(f"Error processing Alpha Vantage data for {symbol}: {e}")
 
     async def _us_collection_loop(self):
         """

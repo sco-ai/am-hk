@@ -566,8 +566,10 @@ class RiskGuardian:
         self.running = True
         logger.info(f"[{self.agent_name}] 风控中心启动")
         
-        # 注册消息处理器
+        # 注册消息处理器 - 支持多种消息类型
         self.consumer.register_handler("trade_decision", self._on_decision)
+        self.consumer.register_handler("decision", self._on_decision)
+        self.consumer.register_handler("trading_decision", self._on_decision)
         
         # 发布状态
         self.bus.publish_status({
@@ -577,7 +579,16 @@ class RiskGuardian:
         })
         
         try:
-            self.consumer.start()
+            # 在后台线程运行消费者
+            import threading
+            consumer_thread = threading.Thread(target=self.consumer.start)
+            consumer_thread.daemon = True
+            consumer_thread.start()
+            logger.info(f"DEBUG: Consumer started in background thread")
+            
+            # 保持主循环运行
+            while self.running:
+                await asyncio.sleep(1)
         except Exception as e:
             logger.error(f"Consumer error: {e}", exc_info=True)
         finally:
@@ -596,7 +607,24 @@ class RiskGuardian:
         logger.info(f"[{self.agent_name}] 已停止")
     
     def _on_decision(self, key: str, value: Dict, headers: Optional[Dict]):
-        """处理交易决策 - 三层风控顺序执行"""
+        """处理交易决策 - 在后台线程中运行"""
+        import threading
+        
+        def run_async_in_thread():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(self._process_decision_async(key, value, headers))
+                loop.close()
+            except Exception as e:
+                logger.error(f"DEBUG: Error in thread processing: {e}", exc_info=True)
+        
+        thread = threading.Thread(target=run_async_in_thread)
+        thread.daemon = True
+        thread.start()
+    
+    async def _process_decision_async(self, key: str, value: Dict, headers: Optional[Dict]):
+        """异步处理交易决策 - 三层风控顺序执行"""
         try:
             payload = value.get("payload", {})
             decision_data = payload.get("decision", {})
@@ -744,7 +772,7 @@ class RiskGuardian:
                 "dynamic_rules": [{"name": r.rule_name, "passed": r.passed} for r in dynamic_results],
                 "anomaly_score": round(anomaly_result.anomaly_score, 4),
             },
-            "timestamp": generate_timestamp(),
+            "timestamp": generate_timestamp().isoformat(),
         }
         
         # 发布到Kafka
@@ -753,7 +781,7 @@ class RiskGuardian:
             "msg_type": "risk_approved_trade",
             "source_agent": self.agent_name,
             "target_agent": "executor",
-            "timestamp": generate_timestamp(),
+            "timestamp": generate_timestamp().isoformat(),
             "priority": 1,
             "payload": output,
         }
@@ -784,7 +812,7 @@ class RiskGuardian:
                 "anomaly_detection": "FAIL" if anomaly_result and anomaly_result.is_anomaly else "PASS",
             },
             "warnings": [reason],
-            "timestamp": generate_timestamp(),
+            "timestamp": generate_timestamp().isoformat(),
         }
         
         # 发布到反馈队列
@@ -793,7 +821,7 @@ class RiskGuardian:
             "msg_type": "risk_rejected_trade",
             "source_agent": self.agent_name,
             "target_agent": "agent6_learning",
-            "timestamp": generate_timestamp(),
+            "timestamp": generate_timestamp().isoformat(),
             "priority": 3,
             "payload": output,
         }

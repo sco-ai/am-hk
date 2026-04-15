@@ -8,11 +8,12 @@ sys.path.insert(0, '/home/ubuntu/.openclaw/workspace/AlphaMind/AM-HK/am-hk')
 
 import asyncio
 import json
+import time
 from datetime import datetime
 
 from agents.agent3_scanner.main import AlphaScanner, Opportunity, Direction, OpportunityPool
 from core.kafka import MessageBus, AgentConsumer
-from core.utils import setup_logging, generate_timestamp
+from core.utils import setup_logging
 
 logger = setup_logging("agent3_scanner_main")
 
@@ -52,11 +53,11 @@ class AlphaScannerAgent:
                 opportunity = {
                     "symbol": symbol,
                     "market": value.get("market", "HK"),
-                    "timestamp": generate_timestamp(),
-                    "score": score,
-                    "direction": "BUY" if score > 0.75 else "HOLD",
-                    "confidence": score,
-                    "factors": factors,
+                    "timestamp": int(time.time()),
+                    "score": round(score, 4),
+                    "direction": "BUY" if score > 0.65 else "HOLD",
+                    "confidence": round(score, 4),
+                    "factors": {k: round(v, 6) if isinstance(v, float) else v for k, v in factors.items()},
                     "source": "agent3_scanner"
                 }
                 

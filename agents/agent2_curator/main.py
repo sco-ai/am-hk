@@ -796,13 +796,31 @@ class DataCurator:
             "data_quality_control": True,
         })
         
+        # 在后台线程运行消费者，避免阻塞事件循环
+        import threading
+        consumer_thread = threading.Thread(target=self._run_consumer_sync, name="Agent2Consumer")
+        consumer_thread.daemon = True
+        consumer_thread.start()
+        logger.info(f"Consumer started in background thread: {consumer_thread.name}")
+        
+        # 保持主循环运行
         try:
-            self.consumer.start()
+            while self.running:
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            logger.info("Main loop cancelled")
         except Exception as e:
-            logger.error(f"Consumer error: {e}", exc_info=True)
+            logger.error(f"Main loop error: {e}", exc_info=True)
         finally:
             await self.stop()
 
+    def _run_consumer_sync(self):
+        """在后台线程中同步运行消费者"""
+        try:
+            self.consumer.start()
+        except Exception as e:
+            logger.error(f"Consumer thread error: {e}", exc_info=True)
+    
     async def stop(self):
         """停止Agent2"""
         logger.info(f"{self.agent_name} stopping...")
@@ -819,11 +837,17 @@ class DataCurator:
         
         logger.info(f"{self.agent_name} stopped")
 
+
     def _on_market_data(self, key: str, value: Dict, headers: Optional[Dict]):
-        """处理市场数据"""
+        """处理市场数据 - 统一入口，根据 data_type 分发到具体处理器"""
         try:
+            # 处理可能的包装格式 (来自 message_bus.py)
+            if "value" in value and "topic" in value:
+                value = value.get("value", value)
+            
             data_type = value.get("data_type", "unknown")
             
+            # 路由到具体处理器
             if data_type == "tick":
                 self._on_tick_data(key, value, headers)
             elif data_type == "kline":
@@ -832,12 +856,47 @@ class DataCurator:
                 self._on_orderbook_data(key, value, headers)
             elif data_type == "capital_flow":
                 self._on_capital_flow(key, value, headers)
+            elif data_type in ["news", "sentiment", "status"]:
+                # 新闻和情绪数据 - 直接透传或记录
+                logger.debug(f"Received {data_type} data for {key}")
+                # 可选：将新闻/情绪也发布到 processed-data 供后续 Agent 使用
+                self._publish_processed_data(key, value, data_type)
+            else:
+                logger.debug(f"Unknown data_type '{data_type}' for key {key}, trying generic processing")
+                # 尝试通用处理
+                if "payload" in value:
+                    self._publish_processed_data(key, value, data_type)
                 
         except Exception as e:
             logger.error(f"Error processing market data: {e}", exc_info=True)
 
+    def _publish_processed_data(self, key: str, value: Dict, data_type: str):
+        """将数据直接发布到 processed-data topic"""
+        try:
+            symbol = value.get("symbol", key)
+            processed_data = {
+                "symbol": symbol,
+                "market": value.get("market", "unknown"),
+                "timestamp": value.get("timestamp", generate_timestamp().isoformat()),
+                "data_type": data_type,
+                "raw_data": value.get("payload", value),
+                "factors": {},
+                "cross_market_signals": [],
+                "quality_score": 1.0,
+                "quality_metrics": {"level": "passthrough"},
+                "processing_timestamp": generate_timestamp().isoformat(),
+            }
+            self.bus.send(topic="am-hk-processed-data", key=symbol, value=processed_data)
+        except Exception as e:
+            logger.error(f"Error publishing processed data: {e}")
+
+
     def _on_tick_data(self, key: str, value: Dict, headers: Optional[Dict]):
         """处理Tick数据"""
+        # 解包可能的包装格式
+        if "value" in value and "topic" in value:
+            value = value.get("value", value)
+        
         symbol = value.get("symbol", key)
         market = value.get("market", "unknown")
         payload = value.get("payload", value)
@@ -892,6 +951,10 @@ class DataCurator:
 
     def _on_kline_data(self, key: str, value: Dict, headers: Optional[Dict]):
         """处理K线数据"""
+        # 解包可能的包装格式
+        if "value" in value and "topic" in value:
+            value = value.get("value", value)
+        
         symbol = value.get("symbol", key)
         market = value.get("market", "unknown")
         payload = value.get("payload", value)
@@ -948,6 +1011,10 @@ class DataCurator:
 
     def _on_orderbook_data(self, key: str, value: Dict, headers: Optional[Dict]):
         """处理订单簿数据"""
+        # 解包可能的包装格式
+        if "value" in value and "topic" in value:
+            value = value.get("value", value)
+        
         symbol = value.get("symbol", key)
         market = value.get("market", "unknown")
         payload = value.get("payload", value)
@@ -985,6 +1052,10 @@ class DataCurator:
 
     def _on_capital_flow(self, key: str, value: Dict, headers: Optional[Dict]):
         """处理资金流数据"""
+        # 解包可能的包装格式
+        if "value" in value and "topic" in value:
+            value = value.get("value", value)
+        
         symbol = value.get("symbol", key)
         market = value.get("market", "unknown")
         payload = value.get("payload", value)
